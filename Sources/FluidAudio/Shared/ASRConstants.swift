@@ -6,10 +6,10 @@ public enum ASRConstants {
     public static let sampleRate: Int = 16_000
 
     /// Maximum audio duration supported by CoreML encoder (seconds)
-    public static let maxDurationSeconds: Double = 15.0
+    public static let maxDurationSeconds: Double = 30.0
 
     /// Maximum audio samples supported by CoreML encoder (sampleRate × maxDurationSeconds)
-    public static let maxModelSamples: Int = 240_000
+    public static let maxModelSamples: Int = 480_000
 
     /// Minimum audio duration accepted by the ASR guard (seconds).
     public static let minimumAudioDurationSeconds: Double = 0.3
