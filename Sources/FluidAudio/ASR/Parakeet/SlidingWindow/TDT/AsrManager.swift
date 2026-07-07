@@ -252,7 +252,8 @@ public actor AsrManager {
                 streamingEnabled: workingConfig.streamingEnabled,
                 streamingThreshold: workingConfig.streamingThreshold,
                 melChunkContext: workingConfig.melChunkContext,
-                dualDecodeArbitration: workingConfig.dualDecodeArbitration
+                dualDecodeArbitration: workingConfig.dualDecodeArbitration,
+                tokenFilterConfidenceThreshold: workingConfig.tokenFilterConfidenceThreshold
             )
         }
 
@@ -267,7 +268,8 @@ public actor AsrManager {
                 streamingEnabled: workingConfig.streamingEnabled,
                 streamingThreshold: workingConfig.streamingThreshold,
                 melChunkContext: workingConfig.melChunkContext,
-                dualDecodeArbitration: workingConfig.dualDecodeArbitration
+                dualDecodeArbitration: workingConfig.dualDecodeArbitration,
+                tokenFilterConfidenceThreshold: workingConfig.tokenFilterConfidenceThreshold
             )
         } else {
             adaptedConfig = workingConfig

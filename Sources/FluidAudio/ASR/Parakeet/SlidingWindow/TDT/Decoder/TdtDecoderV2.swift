@@ -74,7 +74,8 @@ internal struct TdtDecoderV2 {
             streamingEnabled: config.streamingEnabled,
             streamingThreshold: config.streamingThreshold,
             melChunkContext: config.melChunkContext,
-            dualDecodeArbitration: config.dualDecodeArbitration
+            dualDecodeArbitration: config.dualDecodeArbitration,
+            tokenFilterConfidenceThreshold: config.tokenFilterConfidenceThreshold
         )
     }
 }

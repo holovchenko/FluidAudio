@@ -61,6 +61,24 @@ public struct ASRConfig: Sendable {
     /// `melChunkContext = false` path.
     public let dualDecodeArbitration: Bool
 
+    /// Confidence gate for the v3 script-enforcement token filter
+    /// (`TdtDecoderV3.tokenLanguageFilter`). When set, a top-1 token whose
+    /// clamped probability is >= this threshold is KEPT even when its script
+    /// mismatches the `language` hint; only low-confidence wrong-script
+    /// tokens are substituted from top-K.
+    ///
+    /// Rationale: the blanket per-step script gate added for issue #512
+    /// (short monolingual Latin-script speech collapsing into Cyrillic)
+    /// cannot distinguish genuine script drift from intra-utterance
+    /// code-switching — e.g. "macOS" or "MacBook" embedded in Ukrainian
+    /// dictation is decoded correctly at high confidence and then destroyed
+    /// by the substitution. A confidence gate preserves the #512 protection
+    /// (drift tokens are low-confidence) while keeping confident
+    /// code-switched tokens intact.
+    ///
+    /// Default `nil` preserves the existing unconditional-filter behavior.
+    public let tokenFilterConfidenceThreshold: Float?
+
     public static let `default` = ASRConfig()
 
     public init(
@@ -71,7 +89,8 @@ public struct ASRConfig: Sendable {
         streamingEnabled: Bool = true,
         streamingThreshold: Int = 480_000,
         melChunkContext: Bool = true,
-        dualDecodeArbitration: Bool = false
+        dualDecodeArbitration: Bool = false,
+        tokenFilterConfidenceThreshold: Float? = nil
     ) {
         self.sampleRate = sampleRate
         self.tdtConfig = tdtConfig
@@ -81,6 +100,7 @@ public struct ASRConfig: Sendable {
         self.streamingThreshold = streamingThreshold
         self.melChunkContext = melChunkContext
         self.dualDecodeArbitration = dualDecodeArbitration
+        self.tokenFilterConfidenceThreshold = tokenFilterConfidenceThreshold
     }
 }
 
