@@ -288,7 +288,8 @@ internal struct TdtDecoderV3: Sendable {
                 topKLogits: decision.topKLogits,
                 language: language,
                 vocabulary: vocabulary,
-                blankId: blankId
+                blankId: blankId,
+                confidenceThreshold: config.tokenFilterConfidenceThreshold
             )
             if let lang = language, lang.script == .latin, lang != .english,
                 let ids = decision.topKIds, let logits = decision.topKLogits, let vocab = vocabulary
@@ -375,7 +376,8 @@ internal struct TdtDecoderV3: Sendable {
                     topKLogits: innerDecision.topKLogits,
                     language: language,
                     vocabulary: vocabulary,
-                    blankId: blankId
+                    blankId: blankId,
+                    confidenceThreshold: config.tokenFilterConfidenceThreshold
                 )
                 if let lang = language, lang.script == .latin, lang != .english,
                     let ids = innerDecision.topKIds, let logits = innerDecision.topKLogits,
@@ -662,18 +664,25 @@ internal struct TdtDecoderV3: Sendable {
     /// when the joint's top-1 token is in the wrong language for `language`.
     /// No-op when inputs are missing or the prediction is already right.
     ///
+    /// When `confidenceThreshold` is set, a top-1 whose probability is
+    /// >= the threshold is kept even on script mismatch — confident
+    /// code-switched tokens (brand names, proper nouns) are not genuine
+    /// script drift (see ASRConfig.tokenFilterConfidenceThreshold).
+    ///
     /// Blanks are excluded from replacement — substituting silence via top-K
     /// would hallucinate speech, and some vocabs map blankId to an empty string
     /// which would otherwise slip through the `!matches(...)` guard.
-    private static func tokenLanguageFilter(
+    internal static func tokenLanguageFilter(
         label: inout Int,
         score: inout Float,
         topKIds: [Int]?,
         topKLogits: [Float]?,
         language: Language?,
         vocabulary: [Int: String]?,
-        blankId: Int
+        blankId: Int,
+        confidenceThreshold: Float? = nil
     ) {
+        if let threshold = confidenceThreshold, score >= threshold { return }
         guard label != blankId,
             let language = language,
             let vocab = vocabulary,
