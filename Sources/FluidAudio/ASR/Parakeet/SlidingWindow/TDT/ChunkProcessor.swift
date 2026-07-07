@@ -885,6 +885,9 @@ struct ChunkProcessor {
         }
 
         guard overlapLeft.count >= 2 && overlapRight.count >= 2 else {
+            logger.debug(
+                "seam: midpoint fallback (sparse overlap) overlapL=\(overlapLeft.count) overlapR=\(overlapRight.count) boundary=\(String(format: "%.2f", rightStartTime))s"
+            )
             return mergeByMidpoint(
                 left: left, right: right, leftEndTime: leftEndTime, rightStartTime: rightStartTime,
                 frameDuration: frameDuration, spliceSafeTokenIds: spliceSafeTokenIds)
@@ -907,6 +910,9 @@ struct ChunkProcessor {
         let contiguousPairs = contiguousMatches.map { ($0.leftStartIndex, $0.rightStartIndex) }
 
         if contiguousPairs.count >= minimumPairs {
+            logger.debug(
+                "seam: contiguous merge pairs=\(contiguousPairs.count) min=\(minimumPairs) overlapL=\(overlapLeft.count) overlapR=\(overlapRight.count) boundary=\(String(format: "%.2f", rightStartTime))s"
+            )
             return mergeUsingMatches(
                 matches: contiguousPairs,
                 overlapLeft: overlapLeft,
@@ -925,6 +931,9 @@ struct ChunkProcessor {
         )
 
         guard !lcsMatches.isEmpty else {
+            logger.debug(
+                "seam: midpoint fallback (LCS empty) overlapL=\(overlapLeft.count) overlapR=\(overlapRight.count) contiguous=\(contiguousPairs.count) min=\(minimumPairs) boundary=\(String(format: "%.2f", rightStartTime))s"
+            )
             return mergeByMidpoint(
                 left: left, right: right, leftEndTime: leftEndTime, rightStartTime: rightStartTime,
                 frameDuration: frameDuration, spliceSafeTokenIds: spliceSafeTokenIds)
@@ -934,6 +943,9 @@ struct ChunkProcessor {
         // mergeUsingMatches requires one pair per matched element to function correctly
         let lcsPairs = lcsMatches.map { ($0.leftStartIndex, $0.rightStartIndex) }
 
+        logger.debug(
+            "seam: LCS merge pairs=\(lcsPairs.count) overlapL=\(overlapLeft.count) overlapR=\(overlapRight.count) boundary=\(String(format: "%.2f", rightStartTime))s"
+        )
         return mergeUsingMatches(
             matches: lcsPairs,
             overlapLeft: overlapLeft,
@@ -1129,6 +1141,9 @@ struct ChunkProcessor {
                 rightStart = scanIndex
             }
         }
+        logger.debug(
+            "seam: midpoint cut at \(String(format: "%.2f", cutoff))s dropLeftTail=\(left.count - leftEnd) dropRightHead=\(rightStart) leftTotal=\(left.count) rightTotal=\(right.count)"
+        )
         return Array(left[..<leftEnd]) + Array(right[rightStart...])
     }
 }
