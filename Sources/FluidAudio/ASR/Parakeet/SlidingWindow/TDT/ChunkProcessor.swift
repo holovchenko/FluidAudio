@@ -652,6 +652,12 @@ struct ChunkProcessor {
         )
 
         var chunkOutputs: [[TokenWindow]?] = []
+        // Nominal (pre-context/warmup) start sample of each dispatched
+        // window, parallel to `chunkOutputs` — the same "chunkStart" value
+        // the edge-policy grid math (`strideSamples`/`minimumOverlapSamples`
+        // above) is derived from. Used to thread real window-edge trust
+        // bounds into `mergeChunks`'s trust filter.
+        var chunkStartSamples: [Int] = []
         var availableWorkers = Array(workers.indices)
         var inFlight = 0
         var chunkDecision = chunkStarts.first ?? ChunkStartDecision(start: 0, useWarmupPrefix: false)
@@ -712,6 +718,7 @@ struct ChunkProcessor {
                 let index = chunkIndex
                 let chunkStartOffset = warmupSamples > 0 ? contextStart : chunkStart
                 chunkOutputs.append(nil)
+                chunkStartSamples.append(chunkStart)
 
                 group.addTask {
                     var decoderState = TdtDecoderState.make(decoderLayers: decoderLayers)
@@ -803,12 +810,15 @@ struct ChunkProcessor {
             let vocabulary = await manager.vocabulary
             let spliceSafeTokenIds = Self.spliceSafeTokenIds(vocabulary: vocabulary)
             let caseVariantIds = Self.caseVariantCanonicalIds(vocabulary: vocabulary)
-            for chunk in orderedChunkOutputs.dropFirst() {
+            for (offset, chunk) in orderedChunkOutputs.dropFirst().enumerated() {
                 mergedTokens = mergeChunks(
                     mergedTokens,
                     chunk,
                     spliceSafeTokenIds: spliceSafeTokenIds,
-                    caseVariantIds: caseVariantIds
+                    caseVariantIds: caseVariantIds,
+                    leftChunkStart: chunkStartSamples[offset],
+                    rightChunkStart: chunkStartSamples[offset + 1],
+                    chunkSamples: layout.chunkSamples
                 )
             }
             if mergedTokens.count > 1 {
@@ -1064,12 +1074,145 @@ struct ChunkProcessor {
         }
     }
 
+    /// Pre-filters an overlapping window pair's tokens down to their
+    /// trusted regions before `mergeChunks`'s overlap/matching algorithm
+    /// runs. Left tokens whose start frame lies beyond left's trailing
+    /// trust boundary plus `matchMargin` are dropped (they're in left's
+    /// low-trust tail); right tokens ending before right's leading-pad
+    /// boundary minus `matchMargin` are dropped (they're in right's
+    /// low-trust head). The margin keeps enough mutual material at each
+    /// edge for the existing contiguous/LCS matcher to still find anchors.
+    /// Both cuts snap back to a word-initial boundary (via
+    /// `wordInitialIndex`) so a word already mid-stream is never split
+    /// across the filtered/dropped boundary; when no safe boundary can be
+    /// resolved, that side is left unfiltered rather than risk a split.
+    ///
+    /// `leftChunkStart` / `rightChunkStart` / `chunkSamples` are in
+    /// samples; token timestamps are frame indices — this function
+    /// converts internally.
+    internal static func trustFilteredForMerge(
+        left: [TokenWindow],
+        right: [TokenWindow],
+        leftChunkStart: Int,
+        rightChunkStart: Int,
+        chunkSamples: Int,
+        policy: ASREdgePolicy,
+        safeIds: Set<Int>
+    ) -> (left: [TokenWindow], right: [TokenWindow]) {
+        let frame = ASRConstants.samplesPerEncoderFrame
+        let leftChunkStartFrame = leftChunkStart / frame
+        let rightChunkStartFrame = rightChunkStart / frame
+        let chunkFrames = chunkSamples / frame
+        let trailingTrustFrames = policy.trailingTrustSamples / frame
+        let leadingPadFrames = policy.leadingPadSamples / frame
+        let marginFrames = policy.matchMarginSamples / frame
+
+        let leftKeepThreshold = leftChunkStartFrame + chunkFrames - trailingTrustFrames + marginFrames
+        let rightKeepThreshold = rightChunkStartFrame + leadingPadFrames - marginFrames
+
+        let filteredLeft = filterLeftTrailing(left, keepThreshold: leftKeepThreshold, safeIds: safeIds)
+        let filteredRight = filterRightLeading(right, keepThreshold: rightKeepThreshold, safeIds: safeIds)
+        return (filteredLeft, filteredRight)
+    }
+
+    /// Drops left's trailing tokens whose start frame is beyond
+    /// `keepThreshold`, snapping the cut back to a word-initial boundary.
+    private static func filterLeftTrailing(
+        _ tokens: [TokenWindow],
+        keepThreshold: Int,
+        safeIds: Set<Int>
+    ) -> [TokenWindow] {
+        guard let rawCutIndex = tokens.firstIndex(where: { $0.timestamp > keepThreshold }) else {
+            return tokens
+        }
+        guard !safeIds.isEmpty else {
+            // No word-boundary vocabulary supplied — plain threshold cut.
+            return Array(tokens[..<rawCutIndex])
+        }
+        if safeIds.contains(tokens[rawCutIndex].token) {
+            return Array(tokens[..<rawCutIndex])
+        }
+        guard rawCutIndex > 0 else {
+            // The very first token is already a mid-word continuation piece
+            // with no earlier word-initial token to snap to — nothing safe
+            // to drop, leave unfiltered.
+            return tokens
+        }
+        if let wordStart = trustWordInitialIndex(in: tokens, endingAt: rawCutIndex - 1, safeIds: safeIds) {
+            return Array(tokens[..<wordStart])
+        }
+        // No resolvable word boundary — don't filter this side.
+        return tokens
+    }
+
+    /// Drops right's leading tokens whose end frame is before
+    /// `keepThreshold`, snapping the cut back to a word-initial boundary.
+    private static func filterRightLeading(
+        _ tokens: [TokenWindow],
+        keepThreshold: Int,
+        safeIds: Set<Int>
+    ) -> [TokenWindow] {
+        guard let rawKeepStart = tokens.firstIndex(where: { $0.timestamp + $0.duration >= keepThreshold }) else {
+            return []
+        }
+        guard rawKeepStart > 0 else { return tokens }
+        guard !safeIds.isEmpty else {
+            // No word-boundary vocabulary supplied — plain threshold cut.
+            return Array(tokens[rawKeepStart...])
+        }
+        if safeIds.contains(tokens[rawKeepStart].token) {
+            return Array(tokens[rawKeepStart...])
+        }
+        if let wordStart = trustWordInitialIndex(in: tokens, endingAt: rawKeepStart, safeIds: safeIds) {
+            return Array(tokens[wordStart...])
+        }
+        // No resolvable word boundary — don't filter this side.
+        return tokens
+    }
+
+    /// Index of the word-initial (or punctuation) piece starting the word
+    /// that contains `anchor`, or nil when the stream begins mid-word.
+    /// Static twin of the instance-scoped `wordInitialIndex` used by the
+    /// existing seam-splice logic below — identical backward search, but
+    /// callable from `trustFilteredForMerge`'s static context.
+    private static func trustWordInitialIndex(
+        in stream: [TokenWindow],
+        endingAt anchor: Int,
+        safeIds: Set<Int>
+    ) -> Int? {
+        var index = anchor
+        while index >= 0 {
+            if safeIds.contains(stream[index].token) { return index }
+            index -= 1
+        }
+        return nil
+    }
+
     func mergeChunks(
         _ left: [TokenWindow],
         _ right: [TokenWindow],
         spliceSafeTokenIds: Set<Int>? = nil,
-        caseVariantIds: [Int: Int]? = nil
+        caseVariantIds: [Int: Int]? = nil,
+        leftChunkStart: Int? = nil,
+        rightChunkStart: Int? = nil,
+        chunkSamples: Int? = nil
     ) -> [TokenWindow] {
+        var left = left
+        var right = right
+        if let edgePolicy, let leftChunkStart, let rightChunkStart, let chunkSamples {
+            let filtered = Self.trustFilteredForMerge(
+                left: left,
+                right: right,
+                leftChunkStart: leftChunkStart,
+                rightChunkStart: rightChunkStart,
+                chunkSamples: chunkSamples,
+                policy: edgePolicy,
+                safeIds: spliceSafeTokenIds ?? []
+            )
+            left = filtered.left
+            right = filtered.right
+        }
+
         if left.isEmpty { return right }
         if right.isEmpty { return left }
 
