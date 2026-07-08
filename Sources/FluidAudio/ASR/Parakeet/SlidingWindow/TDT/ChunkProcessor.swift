@@ -29,6 +29,16 @@ struct ChunkProcessor {
         let useWarmupPrefix: Bool
     }
 
+    /// One window's dispatch outcome from `process()`'s loop: where it
+    /// starts, where it ends (clamped to `totalSamples`), and whether the
+    /// pipeline should treat it as the final window (flush/end-of-stream
+    /// semantics in `transcribeChunk`).
+    struct DispatchedWindow: Equatable {
+        let start: Int
+        let chunkEnd: Int
+        let isLastChunk: Bool
+    }
+
     // Stateless chunking aligned with CoreML reference:
     // - process ~14.96s of audio per window (frame-aligned) to stay under encoder limit
     // - 2.0s overlap (frame-aligned) to give the decoder slack when merging windows
@@ -135,6 +145,33 @@ struct ChunkProcessor {
             warmupPrefixSamples: warmupPrefixSamples,
             minimumOverlapSamples: minimumOverlapSamples(forChunkSamples: chunkSamples)
         )
+    }
+
+    /// Single source of truth for `process()`'s per-window "is this the last
+    /// dispatched window" decision, shared with the DEBUG-only dispatch-plan
+    /// seam below so the two never drift.
+    ///
+    /// Legacy (`edgePolicy == nil`): unchanged — `isLastChunk` is exactly
+    /// `candidateEnd >= totalSamples` and `chunkEnd` clamps to `totalSamples`
+    /// only on that same window (`min` is a no-op difference from the old
+    /// ternary in that case).
+    ///
+    /// With an edge policy, "last chunk" must be driven by exhaustion of the
+    /// planned `chunkStarts` array, not solely by coverage — otherwise a
+    /// rescue window appended one-past the natural last window (see
+    /// `rescueStartIfNeeded`) is never reached: the natural last window
+    /// already satisfies `candidateEnd >= totalSamples`, so a coverage-only
+    /// check would break the loop before the rescue window is dispatched.
+    private func windowDispatchDecision(
+        candidateEnd: Int,
+        chunkIndex: Int,
+        chunkStartsCount: Int
+    ) -> (chunkEnd: Int, isLastChunk: Bool) {
+        let coversEnd = candidateEnd >= totalSamples
+        let hasMorePlannedStarts = edgePolicy != nil && (chunkIndex + 1) < chunkStartsCount
+        let isLastChunk = coversEnd && !hasMorePlannedStarts
+        let chunkEnd = min(candidateEnd, totalSamples)
+        return (chunkEnd, isLastChunk)
     }
 
     private func chunkStarts(
@@ -275,6 +312,20 @@ struct ChunkProcessor {
     /// fires when `S_r` (pre-clamp) is already later than `lastStart` (that
     /// is what "the natural grid violates coverage" means arithmetically).
     /// The clamp keeps that invariant explicit rather than assumed.
+    ///
+    /// A second, upper clamp enforces the grid invariant for the rescue pair
+    /// itself: `S_r + leadingPad + matchMargin ≤ S_last + chunkSamples −
+    /// trailingTrust`. Without it a policy whose `trailingTrustSeconds` is
+    /// large relative to `leadingPad + matchMargin` (`.default` happens to
+    /// satisfy the invariant only via the unasserted assumption that the
+    /// 4.0s silence-search radius stays under `leadingPad + matchMargin`)
+    /// could silently place a rescue start that violates mutual trust with
+    /// the previous window. The upper bound is frame-*floored* (rounding
+    /// down only shrinks the rescue window's reach, which keeps it inside
+    /// the bound rather than pushing it past). If the floored upper bound
+    /// falls below the lower bound, no valid placement exists — skip the
+    /// rescue rather than emit an invariant-violating start (unreachable for
+    /// sane policies; defensive only).
     private func rescueStartIfNeeded(
         lastStart: Int,
         chunkSamples: Int,
@@ -286,9 +337,26 @@ struct ChunkProcessor {
 
         let rawRescueStart = totalSamples - trustSpan
         let ceiledRescueStart = ((rawRescueStart + frameSamples - 1) / frameSamples) * frameSamples
-        let rescueStart = max(ceiledRescueStart, lastStart + frameSamples)
+        let lowerBound = max(ceiledRescueStart, lastStart + frameSamples)
 
-        return [ChunkStartDecision(start: rescueStart, useWarmupPrefix: false)]
+        let rawUpperBound =
+            lastStart + chunkSamples - edgePolicy.trailingTrustSamples - edgePolicy.leadingPadSamples
+            - edgePolicy.matchMarginSamples
+        let upperBound = floorToFrame(rawUpperBound, frameSamples: frameSamples)
+
+        guard upperBound >= lowerBound else { return [] }
+
+        return [ChunkStartDecision(start: lowerBound, useWarmupPrefix: false)]
+    }
+
+    /// Rounds `value` down to the nearest multiple of `frameSamples`,
+    /// correct for negative `value` too (Swift's `/` truncates toward zero,
+    /// which rounds a negative value *up* — this rounds it down instead).
+    private func floorToFrame(_ value: Int, frameSamples: Int) -> Int {
+        let quotient = value / frameSamples
+        let remainder = value % frameSamples
+        let flooredQuotient = (remainder != 0 && value < 0) ? quotient - 1 : quotient
+        return flooredQuotient * frameSamples
     }
 
     private func bestBoundaryCandidate(
@@ -457,6 +525,66 @@ struct ChunkProcessor {
         ).map { ($0.start, $0.useWarmupPrefix) }
     }
 
+    /// Mirrors `process()`'s window-boundary control flow (start/end/
+    /// isLastChunk sequencing) without decoding, so the dispatch-loop fix
+    /// for the rescue-window-unreachable bug (Finding 1) can be asserted
+    /// directly. Shares `windowDispatchDecision` with `process()` so the
+    /// last-chunk decision itself can never drift between the two; only the
+    /// loop-stepping mechanics (warmup-sample bookkeeping, chunkStart
+    /// advance) are duplicated, matching the existing `chunkStartsForTesting`
+    /// convention of a parallel test-only accessor.
+    internal func dispatchPlanForTesting(
+        melChunkContext: Bool,
+        modelVersion: AsrModelVersion?
+    ) throws -> [DispatchedWindow] {
+        let layout = chunkLayout(melChunkContext: melChunkContext, modelVersion: modelVersion)
+        let chunkStarts = try self.chunkStarts(
+            warmupPrefixSamples: layout.warmupPrefixSamples,
+            chunkSamples: layout.chunkSamples,
+            strideSamples: layout.strideSamples,
+            minimumOverlapSamples: layout.minimumOverlapSamples,
+            preferSilenceAlignment: !melChunkContext && modelVersion == .v3
+        )
+
+        var result: [DispatchedWindow] = []
+        var chunkDecision = chunkStarts.first ?? ChunkStartDecision(start: 0, useWarmupPrefix: false)
+        var chunkStart = chunkDecision.start
+        var chunkIndex = 0
+
+        while chunkStart < totalSamples {
+            let warmupSamples =
+                chunkIndex > 0 && chunkDecision.useWarmupPrefix
+                ? min(layout.warmupPrefixSamples, chunkStart) : 0
+            let visibleChunkSamples = max(
+                ASRConstants.samplesPerEncoderFrame,
+                layout.chunkSamples - warmupSamples
+            )
+            let candidateEnd = chunkStart + visibleChunkSamples
+            let (chunkEnd, isLastChunk) = windowDispatchDecision(
+                candidateEnd: candidateEnd,
+                chunkIndex: chunkIndex,
+                chunkStartsCount: chunkStarts.count
+            )
+
+            if chunkEnd <= chunkStart { break }
+
+            result.append(DispatchedWindow(start: chunkStart, chunkEnd: chunkEnd, isLastChunk: isLastChunk))
+
+            chunkIndex += 1
+            if isLastChunk { break }
+
+            if chunkIndex < chunkStarts.count {
+                chunkDecision = chunkStarts[chunkIndex]
+                chunkStart = chunkDecision.start
+            } else {
+                chunkStart += layout.strideSamples
+                chunkDecision = ChunkStartDecision(start: chunkStart, useWarmupPrefix: false)
+            }
+        }
+
+        return result
+    }
+
     internal func mergeTokenWindowsForTesting(
         left: [(token: Int, timestamp: Int, confidence: Float, duration: Int)],
         right: [(token: Int, timestamp: Int, confidence: Float, duration: Int)],
@@ -551,8 +679,11 @@ struct ChunkProcessor {
                     chunkSamples - warmupSamples
                 )
                 let candidateEnd = chunkStart + visibleChunkSamples
-                let isLastChunk = candidateEnd >= totalSamples
-                let chunkEnd = isLastChunk ? totalSamples : candidateEnd
+                let (chunkEnd, isLastChunk) = windowDispatchDecision(
+                    candidateEnd: candidateEnd,
+                    chunkIndex: chunkIndex,
+                    chunkStartsCount: chunkStarts.count
+                )
 
                 if chunkEnd <= chunkStart {
                     break
@@ -623,7 +754,11 @@ struct ChunkProcessor {
                 inFlight += 1
                 chunkIndex += 1
 
-                if let progressHandler, !isLastChunk {
+                // `chunkEnd < totalSamples` guards against a penultimate
+                // window (now possible with an edge policy's rescue window
+                // still pending) momentarily reporting 100% progress before
+                // the actual last window finishes.
+                if let progressHandler, !isLastChunk, chunkEnd < totalSamples {
                     let progress = min(1.0, max(0.0, Double(chunkEnd) / Double(totalSamples)))
                     await progressHandler(progress)
                 }

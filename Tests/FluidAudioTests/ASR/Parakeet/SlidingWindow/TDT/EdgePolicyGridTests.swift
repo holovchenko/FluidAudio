@@ -144,5 +144,107 @@ final class EdgePolicyGridTests: XCTestCase {
             audio.count - lastStart, layout.chunkSamples - rescuePolicy.trailingTrustSamples,
             "audio end must sit inside the final window's trust region")
         XCTAssertEqual(lastStart % ASRConstants.samplesPerEncoderFrame, 0)
+
+        // Finding 3: positively assert the rescue actually fired — the final
+        // start must equal the formula's S_r (frame-ceiled) and the array
+        // must have grown past the natural grid's last start.
+        let naturalStarts = Array(starts.dropLast())
+        let naturalLastStart = naturalStarts.last!
+        let trustSpan = layout.chunkSamples - rescuePolicy.trailingTrustSamples
+        let rawRescueStart = audio.count - trustSpan
+        let expectedRescueStart =
+            ((rawRescueStart + frameSamples - 1) / frameSamples) * frameSamples
+        XCTAssertEqual(
+            lastStart, expectedRescueStart,
+            "final start must equal the S_r formula's frame-ceiled rescue start")
+        XCTAssertGreaterThan(
+            lastStart, naturalLastStart,
+            "the rescue entry must actually grow the starts array beyond the natural grid's last start")
+    }
+
+    /// Finding 1: the rescue window must actually be dispatched by
+    /// `process()`'s loop, not merely appended to `chunkStarts` and then
+    /// skipped because the natural last window already satisfies the
+    /// coverage-only `isLastChunk` check. Uses the same rescue-triggering
+    /// fixture as `testAudioEndFallsInsideFinalWindowTrust`.
+    func testRescueWindowIsActuallyDispatched() throws {
+        let rescuePolicy = ASREdgePolicy(leadingPadSeconds: 1.0, trailingTrustSeconds: 6.0, matchMarginSeconds: 1.0)
+        let frameSamples = ASRConstants.samplesPerEncoderFrame
+        let probe = ChunkProcessor(audioSamples: [Float](repeating: 0.02, count: 10), edgePolicy: rescuePolicy)
+        let layout = probe.chunkLayoutForTesting(melChunkContext: false, modelVersion: .v3)
+        let stride = layout.strideSamples
+
+        let totalLen = 2 * stride - 5 * frameSamples
+        var audio = [Float](repeating: 0.02, count: totalLen)
+        let pullFrames = 45
+        let boundary = stride - pullFrames * frameSamples
+        for index in (boundary - frameSamples)..<(boundary + frameSamples) {
+            audio[index] = 0
+        }
+
+        let processor = ChunkProcessor(audioSamples: audio, edgePolicy: rescuePolicy)
+        let starts = try processor.chunkStartsForTesting(melChunkContext: false, modelVersion: .v3)
+        XCTAssertGreaterThanOrEqual(starts.count, 2, "fixture must actually trigger a rescue entry")
+
+        let plan = try processor.dispatchPlanForTesting(melChunkContext: false, modelVersion: .v3)
+
+        XCTAssertEqual(
+            plan.map(\.start), starts,
+            "the dispatched sequence must include every planned start, rescue included")
+        XCTAssertEqual(
+            plan.last?.start, starts.last,
+            "the rescue start must be the last dispatched window")
+        XCTAssertEqual(plan.last?.isLastChunk, true, "the rescue window must be flagged as the final chunk")
+        XCTAssertEqual(
+            plan.dropLast().last?.isLastChunk, false,
+            "the natural last window (rescue's predecessor) must no longer be flagged final now that a rescue window follows it")
+    }
+
+    /// Legacy path (`edgePolicy == nil`): the dispatched sequence must be
+    /// identical to the pre-fix behavior — one window, flagged final as soon
+    /// as it covers `totalSamples`.
+    func testLegacyDispatchPlanUnchangedWithoutPolicy() throws {
+        let audio = [Float](repeating: 0.02, count: 95 * ASRConstants.sampleRate)
+        let processor = ChunkProcessor(audioSamples: audio)
+        let starts = try processor.chunkStartsForTesting(melChunkContext: false, modelVersion: .v3)
+        let plan = try processor.dispatchPlanForTesting(melChunkContext: false, modelVersion: .v3)
+
+        XCTAssertEqual(plan.map(\.start), starts)
+        XCTAssertEqual(plan.last?.isLastChunk, true)
+        XCTAssertTrue(
+            plan.dropLast().allSatisfy { !$0.isLastChunk },
+            "only the final dispatched window may be flagged final without an edge policy")
+    }
+
+    /// Finding 2: the rescue pair (predecessor window / rescue window) must
+    /// also satisfy the grid invariant, exercised by the same
+    /// rescue-triggering fixture — the uniform/pocket invariant tests above
+    /// never reach the rescue path.
+    func testGridInvariantHoldsAcrossRescuePair() throws {
+        let rescuePolicy = ASREdgePolicy(leadingPadSeconds: 1.0, trailingTrustSeconds: 6.0, matchMarginSeconds: 1.0)
+        let frameSamples = ASRConstants.samplesPerEncoderFrame
+        let probe = ChunkProcessor(audioSamples: [Float](repeating: 0.02, count: 10), edgePolicy: rescuePolicy)
+        let layout = probe.chunkLayoutForTesting(melChunkContext: false, modelVersion: .v3)
+        let stride = layout.strideSamples
+
+        let totalLen = 2 * stride - 5 * frameSamples
+        var audio = [Float](repeating: 0.02, count: totalLen)
+        let pullFrames = 45
+        let boundary = stride - pullFrames * frameSamples
+        for index in (boundary - frameSamples)..<(boundary + frameSamples) {
+            audio[index] = 0
+        }
+
+        let processor = ChunkProcessor(audioSamples: audio, edgePolicy: rescuePolicy)
+        let starts = try processor.chunkStartsForTesting(melChunkContext: false, modelVersion: .v3)
+        XCTAssertGreaterThanOrEqual(starts.count, 2, "fixture must actually trigger a rescue entry")
+
+        for (s, sNext) in zip(starts, starts.dropFirst()) {
+            let leftTrustEnd = s + layout.chunkSamples - rescuePolicy.trailingTrustSamples
+            let rightTrustStart = sNext + rescuePolicy.leadingPadSamples
+            XCTAssertLessThanOrEqual(
+                rightTrustStart + rescuePolicy.matchMarginSamples, leftTrustEnd,
+                "windows \(s)/\(sNext) (including the rescue pair) leave an uncovered or margin-less band")
+        }
     }
 }
