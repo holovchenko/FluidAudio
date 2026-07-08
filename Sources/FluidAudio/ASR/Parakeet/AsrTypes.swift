@@ -79,6 +79,21 @@ public struct ASRConfig: Sendable {
     /// Default `nil` preserves the existing unconditional-filter behavior.
     public let tokenFilterConfidenceThreshold: Float?
 
+    /// Opt-in window-edge trust region for sliding-window decoding.
+    /// When set, spans near a window's leading/trailing edges are treated
+    /// with reduced trust during stitching/merging rather than the
+    /// mid-window default.
+    ///
+    /// Rationale: corpus word-loss measured by in-window decile is
+    /// U-shaped — decile 0 (leading edge) loses 10.36% of words, decile 9
+    /// (trailing edge) loses 13.16%, versus a 2-4% mid-window baseline.
+    /// The edges are where the encoder has the least surrounding context
+    /// and where adjacent-window stitching is most error-prone.
+    ///
+    /// Default `nil` preserves existing behavior (no edge-aware trust
+    /// region applied).
+    public let edgePolicy: ASREdgePolicy?
+
     public static let `default` = ASRConfig()
 
     public init(
@@ -90,7 +105,8 @@ public struct ASRConfig: Sendable {
         streamingThreshold: Int = 480_000,
         melChunkContext: Bool = true,
         dualDecodeArbitration: Bool = false,
-        tokenFilterConfidenceThreshold: Float? = nil
+        tokenFilterConfidenceThreshold: Float? = nil,
+        edgePolicy: ASREdgePolicy? = nil
     ) {
         self.sampleRate = sampleRate
         self.tdtConfig = tdtConfig
@@ -101,7 +117,57 @@ public struct ASRConfig: Sendable {
         self.melChunkContext = melChunkContext
         self.dualDecodeArbitration = dualDecodeArbitration
         self.tokenFilterConfidenceThreshold = tokenFilterConfidenceThreshold
+        self.edgePolicy = edgePolicy
     }
+}
+
+/// Window-edge trust region for sliding-window decoding.
+///
+/// Corpus word-loss measured by in-window decile is U-shaped: decile 0
+/// (leading edge) loses 10.36% of words, decile 9 (trailing edge) loses
+/// 13.16%, against a 2-4% mid-window baseline. `ASREdgePolicy` defines the
+/// spans, in seconds and frame-aligned samples, over which a window's
+/// leading and trailing edges should be treated as lower-trust relative to
+/// its mid-window content.
+public struct ASREdgePolicy: Sendable {
+    /// Leading-edge span, in seconds, treated as lower-trust.
+    public let leadingPadSeconds: Double
+    /// Trailing-edge span, in seconds, treated as lower-trust.
+    public let trailingTrustSeconds: Double
+    /// Overlap span, in seconds, used when matching content across
+    /// adjacent windows' edges.
+    public let matchMarginSeconds: Double
+
+    public init(
+        leadingPadSeconds: Double,
+        trailingTrustSeconds: Double,
+        matchMarginSeconds: Double
+    ) {
+        self.leadingPadSeconds = leadingPadSeconds
+        self.trailingTrustSeconds = trailingTrustSeconds
+        self.matchMarginSeconds = matchMarginSeconds
+    }
+
+    /// Leading-edge span in frame-aligned samples (16 kHz).
+    public var leadingPadSamples: Int {
+        Int(leadingPadSeconds * 16_000)
+    }
+
+    /// Trailing-edge span in frame-aligned samples (16 kHz).
+    public var trailingTrustSamples: Int {
+        Int(trailingTrustSeconds * 16_000)
+    }
+
+    /// Match-margin span in frame-aligned samples (16 kHz).
+    public var matchMarginSamples: Int {
+        Int(matchMarginSeconds * 16_000)
+    }
+
+    public static let `default` = ASREdgePolicy(
+        leadingPadSeconds: 3.04,
+        trailingTrustSeconds: 6.0,
+        matchMarginSeconds: 2.0
+    )
 }
 
 // MARK: - Results

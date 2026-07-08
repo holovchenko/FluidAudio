@@ -46,6 +46,12 @@ public actor AsrManager {
         config.dualDecodeArbitration
     }
 
+    /// Opt-in window-edge trust region passthrough. `nil` unless the caller
+    /// explicitly configures `ASRConfig.edgePolicy`.
+    internal var edgePolicy: ASREdgePolicy? {
+        config.edgePolicy
+    }
+
     /// Cached vocabulary loaded once during initialization
     internal var vocabulary: [Int: String] = [:]
     #if DEBUG
