@@ -442,7 +442,7 @@ public actor AsrManager {
         }
 
         do {
-            let processor = ChunkProcessor(sampleSource: sampleSource)
+            let processor = ChunkProcessor(sampleSource: sampleSource, edgePolicy: config.edgePolicy)
             let result = try await processor.process(
                 using: self,
                 startTime: startTime,
