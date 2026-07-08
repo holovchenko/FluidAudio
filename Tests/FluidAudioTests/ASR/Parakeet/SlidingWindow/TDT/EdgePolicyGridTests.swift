@@ -37,22 +37,47 @@ final class EdgePolicyGridTests: XCTestCase {
     /// uniform grid (verified empirically: it produces the same starts as
     /// the no-pocket case). Pockets are placed slightly *before* each
     /// target instead, which the aligner can and does select.
+    ///
+    /// Task 6: chunk 0's real-audio content is now shrunk by
+    /// `leadingPadSamples` (its head is sacrificed to a zero-pad prepend),
+    /// so window 1's own `latestCoveredStart` bound is `leadingPadSamples`
+    /// tighter than the naive `1 * stride` target — and because this
+    /// policy's stride is calibrated with zero slack (the collapse
+    /// property above), that one-time tightening carries forward
+    /// unchanged into every later window's bound too (each window's bound
+    /// is `previousStart + chunkSamples - minimumOverlapSamples`, and
+    /// `previousStart` itself already reflects the shift). Pocket
+    /// boundaries are therefore derived from the same recurrence the
+    /// aligner itself uses — mirroring `silenceAlignedChunkStarts`'s
+    /// `latestCoveredStart` formula including the first-transition extra
+    /// pull-back — rather than hardcoded against the unshifted `k * stride`
+    /// grid.
     func testGridInvariantWithSilencePockets() throws {
         let frameSamples = ASRConstants.samplesPerEncoderFrame
         // 95s of near-silent "speech" — matches the uniform test's duration
         // so the same >= 4 window count guarantee holds.
         var audio = [Float](repeating: 0.02, count: 95 * ASRConstants.sampleRate)
-        let stride =
+        let layoutProbe =
             ChunkProcessor(audioSamples: audio, edgePolicy: policy)
             .chunkLayoutForTesting(melChunkContext: false, modelVersion: .v3)
-            .strideSamples
 
-        // Carve a ~2-frame silent pocket just before each of the first
-        // three policy-stride targets (stride, 2*stride, 3*stride), mirroring
-        // the carving pattern in
-        // ChunkProcessorTests.testNoMelV3ChunkStartsPreferNearbySilence.
+        // Carve a ~2-frame silent pocket just before each of the first three
+        // reachable bounds, mirroring the carving pattern in
+        // ChunkProcessorTests.testNoMelV3ChunkStartsPreferNearbySilence, but
+        // computed via the same latestCoveredStart recurrence
+        // silenceAlignedChunkStarts uses (see doc comment) so the pockets
+        // land inside the aligner's actually-reachable search band.
+        var boundaries: [Int] = []
+        var cursor = 0
         for k in 1...3 {
-            let boundary = k * stride - 3 * frameSamples
+            let extraFirstTransitionPullBack = (k == 1) ? policy.leadingPadSamples : 0
+            let latestCoveredStart =
+                cursor + layoutProbe.chunkSamples - layoutProbe.minimumOverlapSamples - extraFirstTransitionPullBack
+            let boundary = latestCoveredStart - 3 * frameSamples
+            boundaries.append(boundary)
+            cursor = boundary
+        }
+        for boundary in boundaries {
             for index in (boundary - frameSamples)..<(boundary + frameSamples) {
                 audio[index] = 0
             }
@@ -78,8 +103,7 @@ final class EdgePolicyGridTests: XCTestCase {
         XCTAssertNotEqual(
             starts, uniformStarts,
             "carved pockets must actually pull starts off the uniform grid, or this test degenerates into testGridInvariantOnUniformSpeech")
-        for k in 1...3 {
-            let expectedPocketStart = k * stride - 3 * frameSamples
+        for expectedPocketStart in boundaries {
             XCTAssertTrue(
                 starts.contains(expectedPocketStart),
                 "expected a chunk start snapped to the carved pocket at \(expectedPocketStart); starts=\(starts)")
@@ -251,25 +275,22 @@ final class EdgePolicyGridTests: XCTestCase {
     /// Fix wave 2, Finding 3 follow-up: `regularChunkStarts` (dual-decode
     /// path C) now threads `edgePolicy` and calls the same
     /// `rescueStartIfNeeded` helper `silenceAlignedChunkStarts` (paths A/B)
-    /// does. This does NOT make the two grids equal-count in general —
-    /// `regularChunkStarts`'s naive fixed-stride last start is always
-    /// within one `strideSamples` of `totalSamples` (loop-exit invariant),
-    /// and `strideSamples < chunkSamples - trailingTrustSamples` always
-    /// holds by construction (`strideSamples = chunkSamples - (leadingPad +
-    /// trailingTrust + matchMargin)`, strictly less whenever `leadingPad +
-    /// matchMargin > 0`), so the naive grid can *never* itself satisfy
-    /// `rescueStartIfNeeded`'s trigger condition. `silenceAlignedChunkStarts`
-    /// has no such bound: its aligner can pull a start earlier than the
-    /// naive target and legitimately trigger the rescue. Using the same
-    /// rescue-triggering fixture as `testAudioEndFallsInsideFinalWindowTrust`
-    /// (which requires exactly this alignment pull to manufacture a
-    /// violation), the aligned grid gains a rescue window the naive grid
-    /// mathematically cannot — verified empirically below. The two grids'
-    /// PRE-rescue trip count is still always identical (both `while` loops
-    /// are driven by the same `strideSamples`/`totalSamples`), so the
-    /// resulting skew is bounded to exactly one window — the skew
-    /// `DualDecodeArbitration`'s merge-loop bounds guard tolerates via
-    /// `offset + 1 < chosenDecisions.count`.
+    /// does. This does NOT make the two grids equal-count in general.
+    ///
+    /// Task 6 update: `regularChunkStarts` now also applies the
+    /// first-transition pull-back (its first stride step is shortened by
+    /// `leadingPadSamples`, mirroring `silenceAlignedChunkStarts`'s
+    /// first-transition `latestCoveredStart` tightening — chunk 0's real
+    /// content is shrunk by the pad regardless of which grid path produced
+    /// its start). For THIS fixture that pull-back happens to give
+    /// `regularChunkStarts` an extra naive window that already covers the
+    /// tail without needing `rescueStartIfNeeded` — collapsing what used to
+    /// be a 1-window skew against `silenceAlignedChunkStarts` (whose own
+    /// first window is unaffected here: the carved pocket sits well inside
+    /// even the tightened bound) down to exact parity. The one-window bound
+    /// `DualDecodeArbitration`'s merge-loop guards against
+    /// (`offset + 1 < chosenDecisions.count`) still holds — parity is
+    /// trivially within that tolerance — verified empirically below.
     func testRegularGridSkewIsAtMostOneWindowVsSilenceAlignedGrid() throws {
         let rescuePolicy = ASREdgePolicy(leadingPadSeconds: 1.0, trailingTrustSeconds: 6.0, matchMarginSeconds: 1.0)
         let frameSamples = ASRConstants.samplesPerEncoderFrame
@@ -300,14 +321,14 @@ final class EdgePolicyGridTests: XCTestCase {
 
         XCTAssertGreaterThanOrEqual(silenceAlignedStarts.count, 2, "fixture must actually trigger a rescue entry")
         XCTAssertEqual(
-            silenceAlignedStarts.count, regularStarts.count + 1,
-            "this fixture's silence pull is exactly what makes the aligned grid gain a rescue window the naive grid mathematically cannot")
+            silenceAlignedStarts.count, regularStarts.count,
+            "Task 6's first-transition pull-back now gives regularChunkStarts an extra naive window for this fixture, collapsing the previous 1-window skew to parity")
         XCTAssertLessThanOrEqual(
             silenceAlignedStarts.count - regularStarts.count, 1,
             "grid skew between the two paths must never exceed the one-window bound the merge loop's bounds guard tolerates")
         XCTAssertLessThanOrEqual(
             audio.count - regularStarts.last!.start, layout.chunkSamples - rescuePolicy.trailingTrustSamples,
-            "regularChunkStarts' naive grid never needs a rescue by rescueStartIfNeeded's own trigger condition — it already sits inside the trust span here, which is exactly why the parity threading is a no-op for this fixture and the merge loop needs the bounds-guard fallback rather than relying on parity alone")
+            "regularChunkStarts' naive grid never needs a rescue by rescueStartIfNeeded's own trigger condition — it already sits inside the trust span here even with the first-transition pull-back")
     }
 
     /// Companion positive case: when no silence pull occurs (the aligner
@@ -344,5 +365,20 @@ final class EdgePolicyGridTests: XCTestCase {
         let layout = processor.chunkLayoutForTesting(melChunkContext: false, modelVersion: .v3)
         let starts = processor.regularChunkStarts(strideSamples: layout.strideSamples, chunkSamples: layout.chunkSamples)
         XCTAssertEqual(starts.map(\.start), Array(stride(from: 0, to: 95 * ASRConstants.sampleRate, by: layout.strideSamples)))
+    }
+
+    /// With edge policy, the first window sacrifices its head to silence pad,
+    /// so the SECOND window must start correspondingly earlier.
+    func testFirstPairAccountsForLeadingPad() throws {
+        let audio = [Float](repeating: 0.02, count: 95 * ASRConstants.sampleRate)
+        let processor = ChunkProcessor(audioSamples: audio, edgePolicy: policy)
+        let starts = try processor.chunkStartsForTesting(melChunkContext: false, modelVersion: .v3)
+        let layout = processor.chunkLayoutForTesting(melChunkContext: false, modelVersion: .v3)
+        // Window 0's trusted CONTENT ends at (chunk - pad - trailingTrust) because the
+        // pad consumes the head of the model input:
+        let win0TrustEnd = layout.chunkSamples - policy.leadingPadSamples - policy.trailingTrustSamples
+        XCTAssertLessThanOrEqual(
+            starts[1] + policy.leadingPadSamples + policy.matchMarginSamples, win0TrustEnd,
+            "second window must compensate for window 0's pad-consumed head")
     }
 }

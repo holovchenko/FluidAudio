@@ -122,6 +122,23 @@ struct ChunkProcessor {
         return raw / ASRConstants.samplesPerEncoderFrame * ASRConstants.samplesPerEncoderFrame
     }
 
+    /// Frame-aligned stride for the very first window transition (chunk 0 →
+    /// chunk 1). With an edge policy, chunk 0's real-audio content is
+    /// shrunk by `leadingPadSamples` (it decodes `pad + samples(0..<chunkSamples
+    /// − leadingPad)`, see `process()`), so its trusted content ends
+    /// `leadingPadSamples` earlier than a normal window's — window 1 must
+    /// start that much earlier too, on top of the generic
+    /// `minimumOverlapSamples` pull-back already baked into `strideSamples`.
+    /// `nil` policy (or a stride already at the 1-frame floor) preserves the
+    /// legacy uniform stride unchanged.
+    private func firstStrideSamples(strideSamples: Int, edgePolicy: ASREdgePolicy?) -> Int {
+        guard let edgePolicy else { return strideSamples }
+        return max(
+            strideSamples - edgePolicy.leadingPadSamples,
+            ASRConstants.samplesPerEncoderFrame
+        )
+    }
+
     func chunkLayout(
         melChunkContext: Bool,
         modelVersion: AsrModelVersion?
@@ -208,7 +225,13 @@ struct ChunkProcessor {
         edgePolicy: ASREdgePolicy? = nil
     ) -> [ChunkStartDecision] {
         var starts = [ChunkStartDecision(start: 0, useWarmupPrefix: false)]
-        var start = strideSamples
+        // Task 6: chunk 0's real-audio content is shrunk by `leadingPadSamples`
+        // (its head is sacrificed to a zero-pad prepend, see `process()`), so
+        // window 1 must start correspondingly earlier to keep the grid
+        // invariant across the first pair — only the first stride step needs
+        // this extra pull-back; every later transition is unaffected (only
+        // chunk 0 is physically padded).
+        var start = firstStrideSamples(strideSamples: strideSamples, edgePolicy: edgePolicy)
         while start < totalSamples {
             starts.append(ChunkStartDecision(start: start, useWarmupPrefix: false))
             start += strideSamples
@@ -242,7 +265,13 @@ struct ChunkProcessor {
 
         while target < totalSamples {
             let targetFrame = target / frameSamples
-            let latestCoveredStart = previousStart + chunkSamples - minimumOverlapSamples
+            // Task 6: the first transition's left window (chunk 0) loses
+            // `leadingPadSamples` of real-audio content to the zero-pad
+            // prepend in `process()`, so its trusted content ends that much
+            // earlier than a normal window's — widen the minimum overlap for
+            // this transition only (every later left window is unpadded).
+            let firstTransitionExtraOverlap = (previousStart == 0) ? (edgePolicy?.leadingPadSamples ?? 0) : 0
+            let latestCoveredStart = previousStart + chunkSamples - minimumOverlapSamples - firstTransitionExtraOverlap
             let targetStart = min(max(targetFrame * frameSamples, previousStart + frameSamples), latestCoveredStart)
 
             let silenceCandidate = try bestBoundaryCandidate(
@@ -703,9 +732,16 @@ struct ChunkProcessor {
                 let warmupSamples =
                     chunkIndex > 0 && chunkDecision.useWarmupPrefix
                     ? min(warmupPrefixSamples, chunkStart) : 0
+                // Task 6: chunk 0 sacrifices `leadingPadSamples` of its head
+                // to a silence zero-pad (mirroring the single-window path's
+                // treatment of the corpus's decile-0 word-loss edge) — its
+                // real-audio content shrinks by that much, matching the
+                // first-transition pull-back the grid start functions above
+                // already apply.
+                let leadingPadSamplesForChunkZero = chunkIndex == 0 ? (edgePolicy?.leadingPadSamples ?? 0) : 0
                 let visibleChunkSamples = max(
                     ASRConstants.samplesPerEncoderFrame,
-                    chunkSamples - warmupSamples
+                    chunkSamples - warmupSamples - leadingPadSamplesForChunkZero
                 )
                 let candidateEnd = chunkStart + visibleChunkSamples
                 let (chunkEnd, isLastChunk) = windowDispatchDecision(
@@ -725,7 +761,15 @@ struct ChunkProcessor {
                 let contextSamples = warmupSamples > 0 ? 0 : (chunkIndex > 0 ? melContextSamples : 0)
                 let contextStart = chunkStart - max(warmupSamples, contextSamples)
                 let chunkLengthWithContext = chunkEnd - contextStart
-                let chunkSamplesArray = try readSamples(offset: contextStart, count: chunkLengthWithContext)
+                let realAudioSamples = try readSamples(offset: contextStart, count: chunkLengthWithContext)
+                // Chunk 0 decodes `[pad(leadingPadSamples zeros) + realAudioSamples]`;
+                // `globalFrameOffsetOverride` below shifts decoded timestamps
+                // back by the same span so they land content-relative despite
+                // the prepended silence.
+                let chunkSamplesArray: [Float] =
+                    leadingPadSamplesForChunkZero > 0
+                    ? [Float](repeating: 0, count: leadingPadSamplesForChunkZero) + realAudioSamples
+                    : realAudioSamples
                 let emitTokensAfterFrame =
                     warmupSamples > 0 ? chunkStart / ASRConstants.samplesPerEncoderFrame : nil
 
@@ -740,6 +784,9 @@ struct ChunkProcessor {
                 let worker = workers[workerIndex]
                 let index = chunkIndex
                 let chunkStartOffset = warmupSamples > 0 ? contextStart : chunkStart
+                let globalFrameOffsetOverride: Int? =
+                    leadingPadSamplesForChunkZero > 0 ? -AsrManager.leadingPadFrames(edgePolicy: edgePolicy) : nil
+                let dropUntrustedLeadingTokens = leadingPadSamplesForChunkZero > 0
                 chunkOutputs.append(nil)
                 chunkStartSamples.append(chunkStart)
 
@@ -759,7 +806,8 @@ struct ChunkProcessor {
                             maxModelSamples: maxModelSamples,
                             language: language,
                             emitTokensAfterFrame: emitTokensAfterFrame,
-                            initialTimeIndexOverride: emitTokensAfterFrame == nil ? nil : 0
+                            initialTimeIndexOverride: emitTokensAfterFrame == nil ? nil : 0,
+                            globalFrameOffsetOverride: globalFrameOffsetOverride
                         )
 
                     guard
@@ -773,8 +821,16 @@ struct ChunkProcessor {
                         windowDurations.count == windowTokens.count
                         ? windowDurations : Array(repeating: 0, count: windowTokens.count)
 
+                    let (finalTokens, finalTimestamps, finalConfidences, finalDurations) =
+                        dropUntrustedLeadingTokens
+                        ? AsrManager.droppingUntrustedLeadingTokens(
+                            tokenIds: windowTokens, timestamps: windowTimestamps,
+                            confidences: windowConfidences, tokenDurations: durations
+                        )
+                        : (windowTokens, windowTimestamps, windowConfidences, durations)
+
                     let windowData: [TokenWindow] = zip(
-                        zip(zip(windowTokens, windowTimestamps), windowConfidences), durations
+                        zip(zip(finalTokens, finalTimestamps), finalConfidences), finalDurations
                     ).map {
                         (token: $0.0.0.0, timestamp: $0.0.0.1, confidence: $0.0.1, duration: $0.1)
                     }
@@ -851,7 +907,12 @@ struct ChunkProcessor {
                     chunkSamples: Self.effectiveLeftMergeSpan(
                         nominalChunkSamples: layout.chunkSamples,
                         totalSamples: totalSamples,
-                        leftChunkStart: leftChunkStart
+                        leftChunkStart: leftChunkStart,
+                        // Task 6: only the FIRST pair's left window is chunk 0
+                        // (the only one physically pad-shrunk); `offset == 0`
+                        // here indexes `orderedChunkOutputs.dropFirst()`, so
+                        // offset 0 is the (chunk0, chunk1) pair.
+                        leadingPadSamples: offset == 0 ? (edgePolicy?.leadingPadSamples ?? 0) : 0
                     )
                 )
             }
@@ -913,7 +974,8 @@ struct ChunkProcessor {
         maxModelSamples: Int,
         language: Language? = nil,
         emitTokensAfterFrame: Int? = nil,
-        initialTimeIndexOverride: Int? = nil
+        initialTimeIndexOverride: Int? = nil,
+        globalFrameOffsetOverride: Int? = nil
     ) async throws -> (tokens: [Int], timestamps: [Int], confidences: [Float], durations: [Int]) {
         guard !samples.isEmpty else { return ([], [], [], []) }
 
@@ -923,8 +985,10 @@ struct ChunkProcessor {
         let actualAudioSamples = samples.count - contextSamples
         let actualFrameCount = ASRConstants.calculateEncoderFrames(from: actualAudioSamples)
 
-        // Global frame offset is based on original chunkStart (not context-adjusted start)
-        let globalFrameOffset = chunkStart / ASRConstants.samplesPerEncoderFrame
+        // Global frame offset is based on original chunkStart (not context-adjusted start),
+        // unless overridden (Task 6: chunk 0's zero-pad prepend needs a negative offset so
+        // decoded timestamps land content-relative despite the pad).
+        let globalFrameOffset = globalFrameOffsetOverride ?? (chunkStart / ASRConstants.samplesPerEncoderFrame)
 
         // Context frame adjustment tells decoder to skip the prepended context frames
         let contextFrames = contextSamples / ASRConstants.samplesPerEncoderFrame
@@ -1117,12 +1181,21 @@ struct ChunkProcessor {
     /// Callers must pass this clamped span — never the nominal one — as
     /// `trustFilteredForMerge`'s `chunkSamples`, or the left keep-threshold
     /// is too permissive and low-trust tail tokens survive the filter.
+    ///
+    /// Task 6: when the left window is chunk 0 under an edge policy, its
+    /// real-audio content is further shrunk by `leadingPadSamples` (the
+    /// head sacrificed to the zero-pad prepend, see `process()`) — callers
+    /// pass that span via `leadingPadSamples` only for the first merge pair
+    /// so `trustFilteredForMerge`'s left keep-threshold reflects chunk 0's
+    /// true (pad-shortened) trusted content end, not the nominal
+    /// full-width window. Every other left window passes `0` (unaffected).
     internal static func effectiveLeftMergeSpan(
         nominalChunkSamples: Int,
         totalSamples: Int,
-        leftChunkStart: Int
+        leftChunkStart: Int,
+        leadingPadSamples: Int = 0
     ) -> Int {
-        min(nominalChunkSamples, totalSamples - leftChunkStart)
+        min(nominalChunkSamples - leadingPadSamples, totalSamples - leftChunkStart)
     }
 
     /// Pre-filters an overlapping window pair's tokens down to their
