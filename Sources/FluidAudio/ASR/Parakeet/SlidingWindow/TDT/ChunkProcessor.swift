@@ -271,7 +271,17 @@ struct ChunkProcessor {
             // earlier than a normal window's — widen the minimum overlap for
             // this transition only (every later left window is unpadded).
             let firstTransitionExtraOverlap = (previousStart == 0) ? (edgePolicy?.leadingPadSamples ?? 0) : 0
-            let latestCoveredStart = previousStart + chunkSamples - minimumOverlapSamples - firstTransitionExtraOverlap
+            // Floor guard (review finding 1): for a pathological public-init
+            // `ASREdgePolicy` where `2*leadingPad + trailingTrust +
+            // matchMargin >= chunkSamples`, the tightened bound above can
+            // fall to/below `previousStart`, which would allow window 1 to
+            // start at or before window 0's start (duplicate window /
+            // negative read offset downstream). Mirror `firstStrideSamples`'s
+            // floor: window 1 must start at least one frame after chunk 0.
+            let latestCoveredStart = max(
+                previousStart + chunkSamples - minimumOverlapSamples - firstTransitionExtraOverlap,
+                previousStart + frameSamples
+            )
             let targetStart = min(max(targetFrame * frameSamples, previousStart + frameSamples), latestCoveredStart)
 
             let silenceCandidate = try bestBoundaryCandidate(
@@ -384,6 +394,15 @@ struct ChunkProcessor {
         edgePolicy: ASREdgePolicy
     ) -> [ChunkStartDecision] {
         let frameSamples = ASRConstants.samplesPerEncoderFrame
+        // Safety note (review finding 2): `trustSpan` here is the nominal,
+        // un-shrunk span even though chunk 0 may be pad-shrunk by
+        // `leadingPadSamples` (Task 6). This is safe specifically for
+        // `lastStart == 0`: that only happens when there was a single
+        // dispatched window, which per `firstStrideSamples`'s guard requires
+        // `firstStrideSamples(...) >= totalSamples` — i.e. chunk 0's grid
+        // stride already covers the whole signal. Chunk 0's real (padded)
+        // content therefore already reaches `totalSamples`, so the nominal
+        // trustSpan can never under-cover and mis-fire a rescue window here.
         let trustSpan = chunkSamples - edgePolicy.trailingTrustSamples
         guard totalSamples - lastStart > trustSpan else { return [] }
 

@@ -413,6 +413,17 @@ extension ChunkProcessor {
     }
 
     /// Decode a single chunk under the given start + warmup parameters.
+    ///
+    /// Task 6 scope note: this path intentionally does NOT apply chunk 0's
+    /// zero-pad prepend (that's `process()`'s primary single-decode loop
+    /// only). The grids feeding this arbitration path (`silenceAlignedChunkStarts`
+    /// / `regularChunkStarts`) are shared, though, so window 1 still gets
+    /// pulled `leadingPadSamples` earlier by Task 6's grid fix even here —
+    /// that only *increases* the overlap between an unpadded chunk 0 and
+    /// window 1 (verified benign: no coverage gap, strictly more shared
+    /// content). Its own `effectiveLeftMergeSpan` call site above correctly
+    /// passes no `leadingPadSamples` override (defaults to 0), matching
+    /// chunk 0's un-shrunk real content here.
     private func decodeOneChunk(
         chunkStart: Int,
         chunkIndex: Int,

@@ -16,7 +16,15 @@ final class EdgePolicyGridTests: XCTestCase {
         let layout = processor.chunkLayoutForTesting(melChunkContext: false, modelVersion: .v3)
         XCTAssertGreaterThanOrEqual(starts.count, 4, "18.88s stride over 95s needs >= 4 more windows")
         for (s, sNext) in zip(starts, starts.dropFirst()) {
-            let leftTrustEnd = s + layout.chunkSamples - policy.trailingTrustSamples
+            // Task 6: pair (0,1)'s left window is chunk 0, whose real content
+            // is shrunk by leadingPadSamples (zero-pad prepend), so its
+            // trusted content ends `leadingPad` earlier than a normal
+            // window's nominal `chunkSamples - trailingTrust`. Every later
+            // left window is unpadded and keeps the nominal bound.
+            let leftTrustEnd =
+                s == 0
+                ? s + layout.chunkSamples - policy.leadingPadSamples - policy.trailingTrustSamples
+                : s + layout.chunkSamples - policy.trailingTrustSamples
             let rightTrustStart = sNext + policy.leadingPadSamples
             XCTAssertLessThanOrEqual(
                 rightTrustStart + policy.matchMarginSamples, leftTrustEnd,
@@ -89,7 +97,12 @@ final class EdgePolicyGridTests: XCTestCase {
         XCTAssertGreaterThanOrEqual(starts.count, 4, "18.88s stride over 95s needs >= 4 more windows")
 
         for (s, sNext) in zip(starts, starts.dropFirst()) {
-            let leftTrustEnd = s + layout.chunkSamples - policy.trailingTrustSamples
+            // Task 6: pair (0,1)'s left window is chunk 0 — tighter bound,
+            // see the matching comment in testGridInvariantOnUniformSpeech.
+            let leftTrustEnd =
+                s == 0
+                ? s + layout.chunkSamples - policy.leadingPadSamples - policy.trailingTrustSamples
+                : s + layout.chunkSamples - policy.trailingTrustSamples
             let rightTrustStart = sNext + policy.leadingPadSamples
             XCTAssertLessThanOrEqual(
                 rightTrustStart + policy.matchMarginSamples, leftTrustEnd,
@@ -380,5 +393,35 @@ final class EdgePolicyGridTests: XCTestCase {
         XCTAssertLessThanOrEqual(
             starts[1] + policy.leadingPadSamples + policy.matchMarginSamples, win0TrustEnd,
             "second window must compensate for window 0's pad-consumed head")
+    }
+
+    /// Fix wave 1, Finding 1: `silenceAlignedChunkStarts`'s first-transition
+    /// `latestCoveredStart` (`previousStart + chunkSamples -
+    /// minimumOverlapSamples - firstTransitionExtraOverlap`) has no floor
+    /// guard. `ASREdgePolicy.init` is public and unvalidated, so any caller
+    /// can construct a policy where `2*leadingPad + trailingTrust +
+    /// matchMargin >= chunkSamples` — for such a policy the bound above
+    /// goes to/below `previousStart` (0), which would let window 1 start at
+    /// or before window 0's start (duplicate window, or a negative sample
+    /// offset once consumed downstream). This pathological policy (30s
+    /// combined minimum overlap vs. the ~29.92s nominal chunk) triggers
+    /// exactly that underflow pre-fix.
+    func testFirstTransitionFloorGuardAgainstPathologicalPolicy() throws {
+        let pathologicalPolicy = ASREdgePolicy(
+            leadingPadSeconds: 15.0, trailingTrustSeconds: 10.0, matchMarginSeconds: 5.0)
+        let audio = [Float](repeating: 0.02, count: 5 * ASRConstants.sampleRate)
+        let processor = ChunkProcessor(audioSamples: audio, edgePolicy: pathologicalPolicy)
+        let starts = try processor.chunkStartsForTesting(melChunkContext: false, modelVersion: .v3)
+
+        XCTAssertGreaterThanOrEqual(starts.count, 2, "fixture must actually reach the first transition")
+        XCTAssertGreaterThan(starts[1], 0, "window 1 must never start at or before window 0's start (0)")
+        for (s, sNext) in zip(starts, starts.dropFirst()) {
+            XCTAssertLessThan(s, sNext, "chunk starts must be strictly increasing")
+        }
+        for s in starts {
+            XCTAssertEqual(s % ASRConstants.samplesPerEncoderFrame, 0, "every start must be frame-aligned")
+            XCTAssertGreaterThanOrEqual(s, 0)
+            XCTAssertLessThan(s, audio.count, "no start may fall at or past the end of the audio")
+        }
     }
 }
