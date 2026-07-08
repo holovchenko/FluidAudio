@@ -811,14 +811,25 @@ struct ChunkProcessor {
             let spliceSafeTokenIds = Self.spliceSafeTokenIds(vocabulary: vocabulary)
             let caseVariantIds = Self.caseVariantCanonicalIds(vocabulary: vocabulary)
             for (offset, chunk) in orderedChunkOutputs.dropFirst().enumerated() {
+                let leftChunkStart = chunkStartSamples[offset]
+                // Finding 1: the left window's REAL content span can be
+                // truncated below the nominal `chunkSamples` — exactly the
+                // rescue scenario (`windowDispatchDecision` clamps
+                // `chunkEnd` to `totalSamples`). Pass the clamped span so
+                // `trustFilteredForMerge`'s left keep-threshold reflects the
+                // window that was actually decoded, not the nominal one.
                 mergedTokens = mergeChunks(
                     mergedTokens,
                     chunk,
                     spliceSafeTokenIds: spliceSafeTokenIds,
                     caseVariantIds: caseVariantIds,
-                    leftChunkStart: chunkStartSamples[offset],
+                    leftChunkStart: leftChunkStart,
                     rightChunkStart: chunkStartSamples[offset + 1],
-                    chunkSamples: layout.chunkSamples
+                    chunkSamples: Self.effectiveLeftMergeSpan(
+                        nominalChunkSamples: layout.chunkSamples,
+                        totalSamples: totalSamples,
+                        leftChunkStart: leftChunkStart
+                    )
                 )
             }
             if mergedTokens.count > 1 {
@@ -1074,6 +1085,23 @@ struct ChunkProcessor {
         }
     }
 
+    /// Finding 1: a merge pair's left window is the nominal `chunkSamples`
+    /// wide only when there's enough audio left to fill it. Whenever the
+    /// left window is the natural last window ahead of a rescue window
+    /// (`windowDispatchDecision` clamps `chunkEnd = min(candidateEnd,
+    /// totalSamples)`), its real decoded content span is `totalSamples -
+    /// leftChunkStart`, which can be smaller than the nominal constant.
+    /// Callers must pass this clamped span — never the nominal one — as
+    /// `trustFilteredForMerge`'s `chunkSamples`, or the left keep-threshold
+    /// is too permissive and low-trust tail tokens survive the filter.
+    internal static func effectiveLeftMergeSpan(
+        nominalChunkSamples: Int,
+        totalSamples: Int,
+        leftChunkStart: Int
+    ) -> Int {
+        min(nominalChunkSamples, totalSamples - leftChunkStart)
+    }
+
     /// Pre-filters an overlapping window pair's tokens down to their
     /// trusted regions before `mergeChunks`'s overlap/matching algorithm
     /// runs. Left tokens whose start frame lies beyond left's trailing
@@ -1138,7 +1166,7 @@ struct ChunkProcessor {
             // to drop, leave unfiltered.
             return tokens
         }
-        if let wordStart = trustWordInitialIndex(in: tokens, endingAt: rawCutIndex - 1, safeIds: safeIds) {
+        if let wordStart = wordInitialIndex(in: tokens, endingAt: rawCutIndex - 1, safeIds: safeIds) {
             return Array(tokens[..<wordStart])
         }
         // No resolvable word boundary — don't filter this side.
@@ -1147,6 +1175,16 @@ struct ChunkProcessor {
 
     /// Drops right's leading tokens whose end frame is before
     /// `keepThreshold`, snapping the cut back to a word-initial boundary.
+    ///
+    /// The not-word-initial branch searches FORWARD for the next
+    /// word-initial token, dropping the straddling word's head — mirroring
+    /// `filterLeftTrailing`'s bias (and `mergeByMidpoint`'s precedent) of
+    /// dropping the straddling word rather than re-admitting low-trust
+    /// material. The grid invariant guarantees the region around this
+    /// threshold lies inside left's kept trusted material, so the left side
+    /// supplies the word; if no later word-initial token exists, this side
+    /// filters to empty rather than searching backward into the low-trust
+    /// head.
     private static func filterRightLeading(
         _ tokens: [TokenWindow],
         keepThreshold: Int,
@@ -1163,19 +1201,20 @@ struct ChunkProcessor {
         if safeIds.contains(tokens[rawKeepStart].token) {
             return Array(tokens[rawKeepStart...])
         }
-        if let wordStart = trustWordInitialIndex(in: tokens, endingAt: rawKeepStart, safeIds: safeIds) {
+        if let wordStart = wordInitialIndex(in: tokens, startingAt: rawKeepStart, safeIds: safeIds) {
             return Array(tokens[wordStart...])
         }
-        // No resolvable word boundary — don't filter this side.
-        return tokens
+        // No later word-initial token exists — filter to empty; left's
+        // kept trusted material covers this region.
+        return []
     }
 
     /// Index of the word-initial (or punctuation) piece starting the word
-    /// that contains `anchor`, or nil when the stream begins mid-word.
-    /// Static twin of the instance-scoped `wordInitialIndex` used by the
-    /// existing seam-splice logic below — identical backward search, but
-    /// callable from `trustFilteredForMerge`'s static context.
-    private static func trustWordInitialIndex(
+    /// that contains `anchor`, searching backward, or nil when the stream
+    /// begins mid-word. Shared core for the instance-scoped overload below
+    /// (used by the seam-splice logic) and `filterLeftTrailing`'s static
+    /// context.
+    private static func wordInitialIndex(
         in stream: [TokenWindow],
         endingAt anchor: Int,
         safeIds: Set<Int>
@@ -1184,6 +1223,23 @@ struct ChunkProcessor {
         while index >= 0 {
             if safeIds.contains(stream[index].token) { return index }
             index -= 1
+        }
+        return nil
+    }
+
+    /// Index of the next word-initial (or punctuation) piece at or after
+    /// `anchor`, searching forward, or nil when no later word-initial token
+    /// exists. Used by `filterRightLeading` to drop a straddling word's head
+    /// rather than re-admit low-trust material by searching backward.
+    private static func wordInitialIndex(
+        in stream: [TokenWindow],
+        startingAt anchor: Int,
+        safeIds: Set<Int>
+    ) -> Int? {
+        var index = anchor
+        while index < stream.count {
+            if safeIds.contains(stream[index].token) { return index }
+            index += 1
         }
         return nil
     }
@@ -1395,7 +1451,7 @@ struct ChunkProcessor {
                 // right-suffix hybrid or glue two words together. Re-splice
                 // at a word boundary so exactly one window segments the
                 // seam word.
-                if let wordStart = wordInitialIndex(in: right, endingAt: lastRight, safeIds: safeIds),
+                if let wordStart = Self.wordInitialIndex(in: right, endingAt: lastRight, safeIds: safeIds),
                     popSeamWord(from: &result, safeIds: safeIds)
                 {
                     // The right window heard the seam word from its start —
@@ -1433,21 +1489,6 @@ struct ChunkProcessor {
         }
 
         return result
-    }
-
-    /// Index of the word-initial (or punctuation) piece starting the word
-    /// that contains `anchor`, or nil when the stream begins mid-word.
-    private func wordInitialIndex(
-        in stream: [TokenWindow],
-        endingAt anchor: Int,
-        safeIds: Set<Int>
-    ) -> Int? {
-        var index = anchor
-        while index >= 0 {
-            if safeIds.contains(stream[index].token) { return index }
-            index -= 1
-        }
-        return nil
     }
 
     /// Remove the trailing seam word (continuation pieces plus its

@@ -315,12 +315,28 @@ extension ChunkProcessor {
             let vocabulary = await manager.vocabulary
             let spliceSafeTokenIds = Self.spliceSafeTokenIds(vocabulary: vocabulary)
             let caseVariantIds = Self.caseVariantCanonicalIds(vocabulary: vocabulary)
-            for chunk in chunkOutputs.dropFirst() {
+            // `chunkOutputs[i]` corresponds to `chosenDecisions[i].start` for
+            // every dispatched index — chunk 0 starts at 0 in all three
+            // paths, and every later chunk in `chunkOutputs` was decoded at
+            // `chosenDecisions[i].start` (the probe phase always adopts a
+            // matching-start path A tokens when the chosen path's decision
+            // coincides with path A's). Thread the same per-pair start
+            // params `process()` uses so the trust filter engages on this
+            // path too; apply the Finding-1 clamp for the left span.
+            for (offset, chunk) in chunkOutputs.dropFirst().enumerated() {
+                let leftChunkStart = chosenDecisions[offset].start
                 mergedTokens = mergeChunks(
                     mergedTokens,
                     chunk,
                     spliceSafeTokenIds: spliceSafeTokenIds,
-                    caseVariantIds: caseVariantIds
+                    caseVariantIds: caseVariantIds,
+                    leftChunkStart: leftChunkStart,
+                    rightChunkStart: chosenDecisions[offset + 1].start,
+                    chunkSamples: Self.effectiveLeftMergeSpan(
+                        nominalChunkSamples: chunkSamples,
+                        totalSamples: totalSamples,
+                        leftChunkStart: leftChunkStart
+                    )
                 )
             }
             if mergedTokens.count > 1 {
