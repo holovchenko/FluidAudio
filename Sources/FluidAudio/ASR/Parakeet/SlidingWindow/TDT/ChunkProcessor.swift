@@ -4,6 +4,13 @@ struct ChunkProcessor {
     let sampleSource: AudioSampleSource
     let totalSamples: Int
 
+    /// Window-edge trust region policy. When set, stride and overlap are
+    /// derived from the policy's leading-pad/trailing-trust/match-margin
+    /// spans so consecutive windows keep a mutual-trust grid invariant
+    /// (see `strideSamples(forChunkSamples:)` / `minimumOverlapSamples`).
+    /// `nil` preserves the legacy stride/overlap derivation unchanged.
+    let edgePolicy: ASREdgePolicy?
+
     private let logger = AppLogger(category: "ChunkProcessor")
     typealias TokenWindow = (token: Int, timestamp: Int, confidence: Float, duration: Int)
     private struct TaskResult: Sendable {
@@ -68,14 +75,40 @@ struct ChunkProcessor {
         return raw / ASRConstants.samplesPerEncoderFrame * ASRConstants.samplesPerEncoderFrame
     }
 
+    /// Legacy (no edge policy) overlap: a flat 2.0s, capped to half the chunk
+    /// and frame-aligned.
     private func overlapSamples(forChunkSamples chunkSamples: Int) -> Int {
         let requested = Int(overlapSeconds * Double(ASRConstants.sampleRate))
         let capped = min(requested, chunkSamples / 2)
         return capped / ASRConstants.samplesPerEncoderFrame * ASRConstants.samplesPerEncoderFrame
     }
 
+    /// Minimum trusted overlap the silence-aligned decision loop must
+    /// preserve between consecutive windows. With an edge policy this is the
+    /// grid invariant's bound (`leadingPad + trailingTrust + matchMargin`);
+    /// without one it is the legacy 6-frame minimum.
+    private func minimumOverlapSamples(forChunkSamples chunkSamples: Int) -> Int {
+        if let edgePolicy {
+            return edgePolicy.leadingPadSamples + edgePolicy.trailingTrustSamples + edgePolicy.matchMarginSamples
+        }
+        return ASRConstants.samplesPerEncoderFrame * 6
+    }
+
+    /// Frame-aligned stride between consecutive window starts. With an edge
+    /// policy, derived so the grid invariant holds:
+    /// `stride = chunkSamples − leadingPad − trailingTrust − matchMargin`.
+    /// Without one, legacy stride (`chunkSamples − 2.0s overlap`) is
+    /// unchanged.
     private func strideSamples(forChunkSamples chunkSamples: Int) -> Int {
-        let raw = max(chunkSamples - overlapSamples(forChunkSamples: chunkSamples), ASRConstants.samplesPerEncoderFrame)
+        let raw: Int
+        if edgePolicy != nil {
+            raw = max(
+                chunkSamples - minimumOverlapSamples(forChunkSamples: chunkSamples),
+                ASRConstants.samplesPerEncoderFrame
+            )
+        } else {
+            raw = max(chunkSamples - overlapSamples(forChunkSamples: chunkSamples), ASRConstants.samplesPerEncoderFrame)
+        }
         return raw / ASRConstants.samplesPerEncoderFrame * ASRConstants.samplesPerEncoderFrame
     }
 
@@ -86,7 +119,8 @@ struct ChunkProcessor {
         chunkSamples: Int,
         strideSamples: Int,
         melContextSamples: Int,
-        warmupPrefixSamples: Int
+        warmupPrefixSamples: Int,
+        minimumOverlapSamples: Int
     ) {
         let chunkSamples = self.chunkSamples(melChunkContext: melChunkContext, modelVersion: modelVersion)
         let warmupPrefixSamples = effectiveWarmupPrefixSamples(
@@ -98,7 +132,8 @@ struct ChunkProcessor {
             chunkSamples: chunkSamples,
             strideSamples: stride,
             melContextSamples: effectiveMelContextSamples(melChunkContext: melChunkContext),
-            warmupPrefixSamples: warmupPrefixSamples
+            warmupPrefixSamples: warmupPrefixSamples,
+            minimumOverlapSamples: minimumOverlapSamples(forChunkSamples: chunkSamples)
         )
     }
 
@@ -106,6 +141,7 @@ struct ChunkProcessor {
         warmupPrefixSamples: Int,
         chunkSamples: Int,
         strideSamples: Int,
+        minimumOverlapSamples: Int,
         preferSilenceAlignment: Bool
     ) throws -> [ChunkStartDecision] {
         guard preferSilenceAlignment || warmupPrefixSamples > 0 else {
@@ -114,6 +150,7 @@ struct ChunkProcessor {
         return try silenceAlignedChunkStarts(
             chunkSamples: chunkSamples,
             strideSamples: strideSamples,
+            minimumOverlapSamples: minimumOverlapSamples,
             canUseWarmupPrefix: warmupPrefixSamples > 0
         )
     }
@@ -131,13 +168,13 @@ struct ChunkProcessor {
     func silenceAlignedChunkStarts(
         chunkSamples: Int,
         strideSamples: Int,
+        minimumOverlapSamples: Int = ASRConstants.samplesPerEncoderFrame * 6,
         canUseWarmupPrefix: Bool
     ) throws -> [ChunkStartDecision] {
         let frameSamples = ASRConstants.samplesPerEncoderFrame
         let silenceSearchRadiusFrames = max(1, Int((4.0 * Double(ASRConstants.sampleRate)) / Double(frameSamples)))
         let valleySearchRadiusFrames = max(1, Int((0.5 * Double(ASRConstants.sampleRate)) / Double(frameSamples)))
         let halfEnergyWindowSamples = frameSamples
-        let minimumOverlapSamples = frameSamples * 6
 
         var starts = [ChunkStartDecision(start: 0, useWarmupPrefix: false)]
         var previousStart = 0
@@ -193,7 +230,7 @@ struct ChunkProcessor {
             }
 
             if bestStart <= previousStart {
-                bestStart = min(previousStart + strideSamples, totalSamples)
+                bestStart = min(previousStart + strideSamples, latestCoveredStart, totalSamples)
             }
 
             starts.append(
@@ -345,7 +382,8 @@ struct ChunkProcessor {
         chunkSamples: Int,
         strideSamples: Int,
         melContextSamples: Int,
-        warmupPrefixSamples: Int
+        warmupPrefixSamples: Int,
+        minimumOverlapSamples: Int
     ) {
         chunkLayout(melChunkContext: melChunkContext, modelVersion: modelVersion)
     }
@@ -369,6 +407,7 @@ struct ChunkProcessor {
             warmupPrefixSamples: layout.warmupPrefixSamples,
             chunkSamples: layout.chunkSamples,
             strideSamples: layout.strideSamples,
+            minimumOverlapSamples: layout.minimumOverlapSamples,
             preferSilenceAlignment: !melChunkContext && modelVersion == .v3
         ).map { ($0.start, $0.useWarmupPrefix) }
     }
@@ -384,14 +423,15 @@ struct ChunkProcessor {
     #endif
 
     /// Initialize with a streaming audio sample source for memory-efficient processing.
-    init(sampleSource: AudioSampleSource) {
+    init(sampleSource: AudioSampleSource, edgePolicy: ASREdgePolicy? = nil) {
         self.sampleSource = sampleSource
         self.totalSamples = sampleSource.sampleCount
+        self.edgePolicy = edgePolicy
     }
 
     /// Convenience initializer for in-memory audio samples.
-    init(audioSamples: [Float]) {
-        self.init(sampleSource: ArrayAudioSampleSource(samples: audioSamples))
+    init(audioSamples: [Float], edgePolicy: ASREdgePolicy? = nil) {
+        self.init(sampleSource: ArrayAudioSampleSource(samples: audioSamples), edgePolicy: edgePolicy)
     }
 
     func process(
@@ -434,6 +474,7 @@ struct ChunkProcessor {
             warmupPrefixSamples: warmupPrefixSamples,
             chunkSamples: chunkSamples,
             strideSamples: strideSamples,
+            minimumOverlapSamples: layout.minimumOverlapSamples,
             preferSilenceAlignment: !melChunkContext && modelVersion == .v3
         )
 

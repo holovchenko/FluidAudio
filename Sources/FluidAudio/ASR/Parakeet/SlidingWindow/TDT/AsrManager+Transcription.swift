@@ -108,7 +108,7 @@ extension AsrManager {
         }
 
         // ChunkProcessor handles stateless chunked transcription for long audio
-        let processor = ChunkProcessor(audioSamples: audioSamples)
+        let processor = ChunkProcessor(audioSamples: audioSamples, edgePolicy: config.edgePolicy)
         let result = try await processor.process(
             using: self,
             startTime: startTime,
