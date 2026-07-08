@@ -2,6 +2,59 @@ import Foundation
 
 extension AsrManager {
 
+    /// Whether `sampleCount` fits the single-window fast path.
+    ///
+    /// Without an edge policy this mirrors the legacy threshold: audio up to
+    /// `ASRConstants.maxModelSamples` decodes in one shot. With an edge
+    /// policy, the fast path is restricted to audio short enough that,
+    /// after leading-pad and trailing-trust are reserved, the model's
+    /// window still ends in trusted (non-edge) content.
+    internal static func usesSingleWindowPath(sampleCount: Int, edgePolicy: ASREdgePolicy?) -> Bool {
+        guard let edgePolicy else {
+            return sampleCount <= ASRConstants.maxModelSamples
+        }
+        let threshold =
+            ASRConstants.maxModelSamples - edgePolicy.leadingPadSamples - edgePolicy.trailingTrustSamples
+        return sampleCount <= threshold
+    }
+
+    /// Number of encoder frames spanned by `edgePolicy.leadingPadSamples`, used as the
+    /// (negated) `globalFrameOffset` so decoded timestamps land content-relative
+    /// despite the leading zero-pad. `nil` policy yields no pad, no offset.
+    internal static func leadingPadFrames(edgePolicy: ASREdgePolicy?) -> Int {
+        guard let edgePolicy else { return 0 }
+        return edgePolicy.leadingPadSamples / ASRConstants.samplesPerEncoderFrame
+    }
+
+    /// Drops tokens whose corrected span ends at or before the trusted content start
+    /// (`timestamp + duration <= 0`), i.e. tokens the decoder emitted entirely within
+    /// the leading zero-pad. Keeps the four lockstep arrays aligned.
+    internal static func droppingUntrustedLeadingTokens(
+        tokenIds: [Int], timestamps: [Int], confidences: [Float], tokenDurations: [Int]
+    ) -> (tokenIds: [Int], timestamps: [Int], confidences: [Float], tokenDurations: [Int]) {
+        guard !tokenIds.isEmpty else {
+            return (tokenIds, timestamps, confidences, tokenDurations)
+        }
+
+        var keptTokenIds: [Int] = []
+        var keptTimestamps: [Int] = []
+        var keptConfidences: [Float] = []
+        var keptDurations: [Int] = []
+
+        for index in 0..<tokenIds.count {
+            let timestamp = index < timestamps.count ? timestamps[index] : 0
+            let duration = index < tokenDurations.count ? tokenDurations[index] : 0
+            guard timestamp + duration > 0 else { continue }
+
+            keptTokenIds.append(tokenIds[index])
+            if index < timestamps.count { keptTimestamps.append(timestamp) }
+            if index < confidences.count { keptConfidences.append(confidences[index]) }
+            if index < tokenDurations.count { keptDurations.append(duration) }
+        }
+
+        return (keptTokenIds, keptTimestamps, keptConfidences, keptDurations)
+    }
+
     internal func transcribeWithState(
         _ audioSamples: [Float], decoderState: inout TdtDecoderState, language: Language? = nil
     ) async throws -> ASRResult {
@@ -12,8 +65,14 @@ extension AsrManager {
         let startTime = Date()
 
         // Route to appropriate processing method based on audio length
-        if audioSamples.count <= ASRConstants.maxModelSamples {
-            let (alignedSamples, frameAlignedLength) = frameAlignedAudio(audioSamples)
+        let edgePolicy = config.edgePolicy
+        if Self.usesSingleWindowPath(sampleCount: audioSamples.count, edgePolicy: edgePolicy) {
+            let leadingPadSamples = edgePolicy?.leadingPadSamples ?? 0
+            let paddedInput: [Float] =
+                leadingPadSamples > 0
+                ? [Float](repeating: 0, count: leadingPadSamples) + audioSamples
+                : audioSamples
+            let (alignedSamples, frameAlignedLength) = frameAlignedAudio(paddedInput)
             let paddedAudio: [Float] = padAudioIfNeeded(alignedSamples, targetLength: ASRConstants.maxModelSamples)
             let (hypothesis, encoderSequenceLength) = try await executeMLInferenceWithTimings(
                 paddedAudio,
@@ -21,14 +80,25 @@ extension AsrManager {
                 actualAudioFrames: nil,  // Will be calculated from originalLength
                 decoderState: &decoderState,
                 isLastChunk: true,  // Single-chunk: always first and last
+                globalFrameOffset: -Self.leadingPadFrames(edgePolicy: edgePolicy),
                 language: language
             )
 
+            let (tokenIds, timestamps, confidences, tokenDurations) =
+                edgePolicy != nil
+                ? Self.droppingUntrustedLeadingTokens(
+                    tokenIds: hypothesis.ySequence,
+                    timestamps: hypothesis.timestamps,
+                    confidences: hypothesis.tokenConfidences,
+                    tokenDurations: hypothesis.tokenDurations
+                )
+                : (hypothesis.ySequence, hypothesis.timestamps, hypothesis.tokenConfidences, hypothesis.tokenDurations)
+
             let result = processTranscriptionResult(
-                tokenIds: hypothesis.ySequence,
-                timestamps: hypothesis.timestamps,
-                confidences: hypothesis.tokenConfidences,
-                tokenDurations: hypothesis.tokenDurations,
+                tokenIds: tokenIds,
+                timestamps: timestamps,
+                confidences: confidences,
+                tokenDurations: tokenDurations,
                 encoderSequenceLength: encoderSequenceLength,
                 audioSamples: audioSamples,
                 processingTime: Date().timeIntervalSince(startTime)
