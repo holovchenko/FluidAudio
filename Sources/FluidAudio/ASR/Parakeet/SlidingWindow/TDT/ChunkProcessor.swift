@@ -243,7 +243,52 @@ struct ChunkProcessor {
             target += strideSamples
         }
 
+        if let edgePolicy {
+            starts.append(
+                contentsOf: rescueStartIfNeeded(
+                    lastStart: previousStart,
+                    chunkSamples: chunkSamples,
+                    edgePolicy: edgePolicy
+                )
+            )
+        }
+
         return starts
+    }
+
+    /// Appends one extra window start when the natural grid's last window
+    /// leaves audio end outside its trust region (`totalSamples − S_last >
+    /// chunkSamples − trailingTrust`). The rescue start is placed so audio
+    /// end lands exactly at the trust boundary: `S_r = totalSamples −
+    /// (chunkSamples − trailingTrust)`.
+    ///
+    /// `S_r` is frame-*ceiled* (rounded up), not floored: flooring moves
+    /// `S_r` earlier, which *increases* `totalSamples − S_r` and can push it
+    /// back past the trust boundary it was placed to satisfy — the opposite
+    /// of the intent. Ceiling only shrinks `totalSamples − S_r`, so the
+    /// post-rounding coverage property `totalSamples − S_r ≤ chunkSamples −
+    /// trailingTrust` still holds (the pre-rounding value satisfies it with
+    /// equality).
+    ///
+    /// The rescue start is also clamped to be later than `lastStart` by at
+    /// least one frame — trivially satisfied here since the rescue only
+    /// fires when `S_r` (pre-clamp) is already later than `lastStart` (that
+    /// is what "the natural grid violates coverage" means arithmetically).
+    /// The clamp keeps that invariant explicit rather than assumed.
+    private func rescueStartIfNeeded(
+        lastStart: Int,
+        chunkSamples: Int,
+        edgePolicy: ASREdgePolicy
+    ) -> [ChunkStartDecision] {
+        let frameSamples = ASRConstants.samplesPerEncoderFrame
+        let trustSpan = chunkSamples - edgePolicy.trailingTrustSamples
+        guard totalSamples - lastStart > trustSpan else { return [] }
+
+        let rawRescueStart = totalSamples - trustSpan
+        let ceiledRescueStart = ((rawRescueStart + frameSamples - 1) / frameSamples) * frameSamples
+        let rescueStart = max(ceiledRescueStart, lastStart + frameSamples)
+
+        return [ChunkStartDecision(start: rescueStart, useWarmupPrefix: false)]
     }
 
     private func bestBoundaryCandidate(

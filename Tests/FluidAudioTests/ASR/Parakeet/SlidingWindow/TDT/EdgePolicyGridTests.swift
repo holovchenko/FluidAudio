@@ -93,4 +93,56 @@ final class EdgePolicyGridTests: XCTestCase {
         // 29de8bdf stride: chunk minus 2.0s overlap
         XCTAssertEqual(layout.strideSamples, layout.chunkSamples - 32_000)
     }
+
+    /// Audio whose end would land in the last window's damage tail must get
+    /// a rescue window: end-of-audio inside the final window's trust region.
+    ///
+    /// In-test adaptation (per plan note): neither the brief's hardcoded
+    /// 48.5s nor the brief's length-derivation fallback (`starts[1] +
+    /// chunkSamples - trailingTrust + 5 frames`) actually violates the
+    /// invariant against `.default`'s real silence-aligned grid. This is
+    /// provable, not just empirical: the silence aligner can pull a window
+    /// start earlier than its naive stride target by at most the hardcoded
+    /// search radius (4.0s = 64_000 samples,
+    /// `silenceSearchRadiusFrames` in `ChunkProcessor`), so the worst-case
+    /// natural gap to audio end is `stride + 64_000` samples — and for
+    /// `.default` (leadingPad 3.04s + matchMargin 2.0s = 5.04s > 4.0s
+    /// radius), `stride + 64_000 < chunkSamples - trailingTrust` always, so
+    /// `.default` can never violate the invariant via this loop regardless
+    /// of audio length or silence placement.
+    /// A violation requires `radius > leadingPad + matchMargin` (in
+    /// samples), which `.default` doesn't satisfy. This test therefore uses
+    /// a local policy with a smaller `leadingPad + matchMargin` (2.0s) than
+    /// the 4.0s search radius, then carves a silence pocket ahead of the
+    /// natural stride target — well within the documented, reproducible
+    /// mechanics above — to pull the window start early enough to violate.
+    func testAudioEndFallsInsideFinalWindowTrust() throws {
+        let rescuePolicy = ASREdgePolicy(leadingPadSeconds: 1.0, trailingTrustSeconds: 6.0, matchMarginSeconds: 1.0)
+        let frameSamples = ASRConstants.samplesPerEncoderFrame
+        let probe = ChunkProcessor(audioSamples: [Float](repeating: 0.02, count: 10), edgePolicy: rescuePolicy)
+        let layout = probe.chunkLayoutForTesting(melChunkContext: false, modelVersion: .v3)
+        let stride = layout.strideSamples
+
+        // Total length just under 2*stride so the natural grid is [0, ~stride]
+        // only (no third window). Carve a silence pocket 45 frames (57_600
+        // samples) before the stride target — inside the 50-frame search
+        // radius — so the aligner snaps the second window's start there
+        // instead of the naive target, pulling it back further than
+        // leadingPad + matchMargin (32_000 samples) can absorb.
+        let totalLen = 2 * stride - 5 * frameSamples
+        var audio = [Float](repeating: 0.02, count: totalLen)
+        let pullFrames = 45
+        let boundary = stride - pullFrames * frameSamples
+        for index in (boundary - frameSamples)..<(boundary + frameSamples) {
+            audio[index] = 0
+        }
+
+        let processor = ChunkProcessor(audioSamples: audio, edgePolicy: rescuePolicy)
+        let starts = try processor.chunkStartsForTesting(melChunkContext: false, modelVersion: .v3)
+        let lastStart = starts.last!
+        XCTAssertLessThanOrEqual(
+            audio.count - lastStart, layout.chunkSamples - rescuePolicy.trailingTrustSamples,
+            "audio end must sit inside the final window's trust region")
+        XCTAssertEqual(lastStart % ASRConstants.samplesPerEncoderFrame, 0)
+    }
 }
