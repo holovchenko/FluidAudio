@@ -72,7 +72,11 @@ extension ChunkProcessor {
             strideSamples: strideSamples,
             canUseWarmupPrefix: true
         )
-        let pathCStartsDecisions = regularChunkStarts(strideSamples: strideSamples)
+        let pathCStartsDecisions = regularChunkStarts(
+            strideSamples: strideSamples,
+            chunkSamples: chunkSamples,
+            edgePolicy: edgePolicy
+        )
 
         let pathBCount = pathBStartsDecisions.count
         let pathCCount = pathCStartsDecisions.count
@@ -300,6 +304,34 @@ extension ChunkProcessor {
             }
         }
 
+        // Grid skew invariant: `regularChunkStarts` (path C) now threads the
+        // same `edgePolicy` and calls the same `rescueStartIfNeeded` helper
+        // `silenceAlignedChunkStarts` (paths A/B) does, but this does NOT
+        // guarantee equal counts — the two rescue checks are not redundant.
+        // `rescueStartIfNeeded`'s trigger is `totalSamples - lastStart >
+        // chunkSamples - trailingTrust`; for `regularChunkStarts`'s naive
+        // fixed-stride grid, `lastStart` is always within one `strideSamples`
+        // of `totalSamples` (loop-exit invariant), and `strideSamples =
+        // chunkSamples - (leadingPad + trailingTrust + matchMargin) <
+        // chunkSamples - trailingTrust` whenever `leadingPad + matchMargin >
+        // 0` — so the naive grid can *never* satisfy the rescue condition.
+        // `silenceAlignedChunkStarts` has no such bound: its aligner can pull
+        // a start earlier than the naive target, shrinking coverage enough
+        // to trigger the rescue legitimately. So paths A/B can gain a rescue
+        // window that path C mathematically cannot (verified empirically:
+        // a rescue-triggering fixture yields silence-aligned count 3 vs.
+        // regular count 2 even with this parity threading in place). The
+        // resulting skew is bounded to at most one window, since both start
+        // sequences share an identical pre-rescue trip count (same
+        // `strideSamples`/`totalSamples` drive both `while` loops) and only
+        // the rescue append can differ. The merge loop below tolerates that
+        // one-window skew via a bounds guard rather than indexing
+        // `chosenDecisions[offset + 1]` unconditionally.
+        assert(
+            chunkOutputs.count <= chosenDecisions.count + 1,
+            "dual-decode grid skew invariant violated: chunkOutputs.count (\(chunkOutputs.count)) must be at most one greater than chosenDecisions.count (\(chosenDecisions.count))"
+        )
+
         guard var mergedTokens = chunkOutputs.first else {
             return await manager.processTranscriptionResult(
                 tokenIds: [],
@@ -325,19 +357,36 @@ extension ChunkProcessor {
             // path too; apply the Finding-1 clamp for the left span.
             for (offset, chunk) in chunkOutputs.dropFirst().enumerated() {
                 let leftChunkStart = chosenDecisions[offset].start
-                mergedTokens = mergeChunks(
-                    mergedTokens,
-                    chunk,
-                    spliceSafeTokenIds: spliceSafeTokenIds,
-                    caseVariantIds: caseVariantIds,
-                    leftChunkStart: leftChunkStart,
-                    rightChunkStart: chosenDecisions[offset + 1].start,
-                    chunkSamples: Self.effectiveLeftMergeSpan(
-                        nominalChunkSamples: chunkSamples,
-                        totalSamples: totalSamples,
-                        leftChunkStart: leftChunkStart
+                // `chosenDecisions[offset]` is always in bounds (see the
+                // skew-invariant note above: only a trailing +1 skew is
+                // possible). `chosenDecisions[offset + 1]` is not — path C's
+                // grid can be exactly one window shorter than `chunkOutputs`
+                // on short audio. Fall back to an unfiltered merge (no
+                // trust-region pre-filter) for that one unmatched tail pair
+                // rather than index out of bounds; every other pair still
+                // gets the trust-filtered merge.
+                if offset + 1 < chosenDecisions.count {
+                    mergedTokens = mergeChunks(
+                        mergedTokens,
+                        chunk,
+                        spliceSafeTokenIds: spliceSafeTokenIds,
+                        caseVariantIds: caseVariantIds,
+                        leftChunkStart: leftChunkStart,
+                        rightChunkStart: chosenDecisions[offset + 1].start,
+                        chunkSamples: Self.effectiveLeftMergeSpan(
+                            nominalChunkSamples: chunkSamples,
+                            totalSamples: totalSamples,
+                            leftChunkStart: leftChunkStart
+                        )
                     )
-                )
+                } else {
+                    mergedTokens = mergeChunks(
+                        mergedTokens,
+                        chunk,
+                        spliceSafeTokenIds: spliceSafeTokenIds,
+                        caseVariantIds: caseVariantIds
+                    )
+                }
             }
             if mergedTokens.count > 1 {
                 mergedTokens.sort { $0.timestamp < $1.timestamp }

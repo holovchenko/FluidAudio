@@ -247,4 +247,102 @@ final class EdgePolicyGridTests: XCTestCase {
                 "windows \(s)/\(sNext) (including the rescue pair) leave an uncovered or margin-less band")
         }
     }
+
+    /// Fix wave 2, Finding 3 follow-up: `regularChunkStarts` (dual-decode
+    /// path C) now threads `edgePolicy` and calls the same
+    /// `rescueStartIfNeeded` helper `silenceAlignedChunkStarts` (paths A/B)
+    /// does. This does NOT make the two grids equal-count in general —
+    /// `regularChunkStarts`'s naive fixed-stride last start is always
+    /// within one `strideSamples` of `totalSamples` (loop-exit invariant),
+    /// and `strideSamples < chunkSamples - trailingTrustSamples` always
+    /// holds by construction (`strideSamples = chunkSamples - (leadingPad +
+    /// trailingTrust + matchMargin)`, strictly less whenever `leadingPad +
+    /// matchMargin > 0`), so the naive grid can *never* itself satisfy
+    /// `rescueStartIfNeeded`'s trigger condition. `silenceAlignedChunkStarts`
+    /// has no such bound: its aligner can pull a start earlier than the
+    /// naive target and legitimately trigger the rescue. Using the same
+    /// rescue-triggering fixture as `testAudioEndFallsInsideFinalWindowTrust`
+    /// (which requires exactly this alignment pull to manufacture a
+    /// violation), the aligned grid gains a rescue window the naive grid
+    /// mathematically cannot — verified empirically below. The two grids'
+    /// PRE-rescue trip count is still always identical (both `while` loops
+    /// are driven by the same `strideSamples`/`totalSamples`), so the
+    /// resulting skew is bounded to exactly one window — the skew
+    /// `DualDecodeArbitration`'s merge-loop bounds guard tolerates via
+    /// `offset + 1 < chosenDecisions.count`.
+    func testRegularGridSkewIsAtMostOneWindowVsSilenceAlignedGrid() throws {
+        let rescuePolicy = ASREdgePolicy(leadingPadSeconds: 1.0, trailingTrustSeconds: 6.0, matchMarginSeconds: 1.0)
+        let frameSamples = ASRConstants.samplesPerEncoderFrame
+        let probe = ChunkProcessor(audioSamples: [Float](repeating: 0.02, count: 10), edgePolicy: rescuePolicy)
+        let layout = probe.chunkLayoutForTesting(melChunkContext: false, modelVersion: .v3)
+        let stride = layout.strideSamples
+
+        let totalLen = 2 * stride - 5 * frameSamples
+        var audio = [Float](repeating: 0.02, count: totalLen)
+        let pullFrames = 45
+        let boundary = stride - pullFrames * frameSamples
+        for index in (boundary - frameSamples)..<(boundary + frameSamples) {
+            audio[index] = 0
+        }
+
+        let processor = ChunkProcessor(audioSamples: audio, edgePolicy: rescuePolicy)
+        let silenceAlignedStarts = try processor.silenceAlignedChunkStarts(
+            chunkSamples: layout.chunkSamples,
+            strideSamples: layout.strideSamples,
+            minimumOverlapSamples: layout.minimumOverlapSamples,
+            canUseWarmupPrefix: false
+        )
+        let regularStarts = processor.regularChunkStarts(
+            strideSamples: layout.strideSamples,
+            chunkSamples: layout.chunkSamples,
+            edgePolicy: rescuePolicy
+        )
+
+        XCTAssertGreaterThanOrEqual(silenceAlignedStarts.count, 2, "fixture must actually trigger a rescue entry")
+        XCTAssertEqual(
+            silenceAlignedStarts.count, regularStarts.count + 1,
+            "this fixture's silence pull is exactly what makes the aligned grid gain a rescue window the naive grid mathematically cannot")
+        XCTAssertLessThanOrEqual(
+            silenceAlignedStarts.count - regularStarts.count, 1,
+            "grid skew between the two paths must never exceed the one-window bound the merge loop's bounds guard tolerates")
+        XCTAssertLessThanOrEqual(
+            audio.count - regularStarts.last!.start, layout.chunkSamples - rescuePolicy.trailingTrustSamples,
+            "regularChunkStarts' naive grid never needs a rescue by rescueStartIfNeeded's own trigger condition — it already sits inside the trust span here, which is exactly why the parity threading is a no-op for this fixture and the merge loop needs the bounds-guard fallback rather than relying on parity alone")
+    }
+
+    /// Companion positive case: when no silence pull occurs (the aligner
+    /// falls back to the naive targets, as in `testGridInvariantOnUniformSpeech`),
+    /// `regularChunkStarts` and `silenceAlignedChunkStarts` produce identical
+    /// grids, so the shared `rescueStartIfNeeded` call agrees for both
+    /// (same `lastStart` in either grid) and counts match exactly.
+    func testRegularGridMatchesSilenceAlignedGridWithoutAlignmentPull() throws {
+        let policy = ASREdgePolicy.default
+        let audio = [Float](repeating: 0.02, count: 95 * ASRConstants.sampleRate)
+        let processor = ChunkProcessor(audioSamples: audio, edgePolicy: policy)
+        let layout = processor.chunkLayoutForTesting(melChunkContext: false, modelVersion: .v3)
+
+        let silenceAlignedStarts = try processor.silenceAlignedChunkStarts(
+            chunkSamples: layout.chunkSamples,
+            strideSamples: layout.strideSamples,
+            minimumOverlapSamples: layout.minimumOverlapSamples,
+            canUseWarmupPrefix: false
+        )
+        let regularStarts = processor.regularChunkStarts(
+            strideSamples: layout.strideSamples,
+            chunkSamples: layout.chunkSamples,
+            edgePolicy: policy
+        )
+
+        XCTAssertEqual(regularStarts.map(\.start), silenceAlignedStarts.map(\.start))
+    }
+
+    /// Legacy invariant: `edgePolicy == nil` must still produce a byte-
+    /// identical grid from `regularChunkStarts` with the new signature.
+    func testRegularChunkStartsUnchangedWithoutPolicy() throws {
+        let audio = [Float](repeating: 0.02, count: 95 * ASRConstants.sampleRate)
+        let processor = ChunkProcessor(audioSamples: audio)
+        let layout = processor.chunkLayoutForTesting(melChunkContext: false, modelVersion: .v3)
+        let starts = processor.regularChunkStarts(strideSamples: layout.strideSamples, chunkSamples: layout.chunkSamples)
+        XCTAssertEqual(starts.map(\.start), Array(stride(from: 0, to: 95 * ASRConstants.sampleRate, by: layout.strideSamples)))
+    }
 }

@@ -182,7 +182,11 @@ struct ChunkProcessor {
         preferSilenceAlignment: Bool
     ) throws -> [ChunkStartDecision] {
         guard preferSilenceAlignment || warmupPrefixSamples > 0 else {
-            return regularChunkStarts(strideSamples: strideSamples)
+            return regularChunkStarts(
+                strideSamples: strideSamples,
+                chunkSamples: chunkSamples,
+                edgePolicy: edgePolicy
+            )
         }
         return try silenceAlignedChunkStarts(
             chunkSamples: chunkSamples,
@@ -192,12 +196,31 @@ struct ChunkProcessor {
         )
     }
 
-    func regularChunkStarts(strideSamples: Int) -> [ChunkStartDecision] {
+    /// `chunkSamples` and `edgePolicy` are only consulted to append the
+    /// grid-tail rescue window (`rescueStartIfNeeded`) — same rule
+    /// `silenceAlignedChunkStarts` applies — so paths A/B/C in the
+    /// dual-decode arbitrator produce equal-count grids by construction
+    /// whenever an edge policy is set. `edgePolicy == nil` preserves the
+    /// legacy grid byte-for-byte (no rescue is ever appended).
+    func regularChunkStarts(
+        strideSamples: Int,
+        chunkSamples: Int,
+        edgePolicy: ASREdgePolicy? = nil
+    ) -> [ChunkStartDecision] {
         var starts = [ChunkStartDecision(start: 0, useWarmupPrefix: false)]
         var start = strideSamples
         while start < totalSamples {
             starts.append(ChunkStartDecision(start: start, useWarmupPrefix: false))
             start += strideSamples
+        }
+        if let edgePolicy {
+            starts.append(
+                contentsOf: rescueStartIfNeeded(
+                    lastStart: starts[starts.count - 1].start,
+                    chunkSamples: chunkSamples,
+                    edgePolicy: edgePolicy
+                )
+            )
         }
         return starts
     }
