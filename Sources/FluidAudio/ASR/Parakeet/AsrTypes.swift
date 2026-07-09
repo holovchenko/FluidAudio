@@ -94,6 +94,25 @@ public struct ASRConfig: Sendable {
     /// region applied).
     public let edgePolicy: ASREdgePolicy?
 
+    /// Repair pass for chunk-seam content drops in long-form batch
+    /// transcription (issue #758). The chunk merger can deterministically
+    /// drop multi-second spans of clear speech at a chunk boundary when the
+    /// overlap region is low-SNR (crosstalk, applause, soft speech). After
+    /// merging, gaps between consecutive tokens longer than
+    /// `seamGapRepairMinGapSeconds` whose audio contains speech-level energy
+    /// are re-decoded with a single fresh window centred on the gap — the
+    /// seam does not exist in the re-decode — and only tokens that fall
+    /// strictly inside the gap are spliced in, starting at a word-initial
+    /// piece. Genuine silence yields no in-gap tokens and is left untouched.
+    ///
+    /// Cost: one extra window decode per probed gap (typically 0–3 per
+    /// half-hour file). Applies to the stateless chunked batch path only.
+    public let seamGapRepair: Bool
+
+    /// Minimum inter-token gap, in seconds, that triggers a seam-gap repair
+    /// probe when `seamGapRepair` is enabled.
+    public let seamGapRepairMinGapSeconds: Double
+
     public static let `default` = ASRConfig()
 
     public init(
@@ -106,7 +125,9 @@ public struct ASRConfig: Sendable {
         melChunkContext: Bool = true,
         dualDecodeArbitration: Bool = false,
         tokenFilterConfidenceThreshold: Float? = nil,
-        edgePolicy: ASREdgePolicy? = nil
+        edgePolicy: ASREdgePolicy? = nil,
+        seamGapRepair: Bool = true,
+        seamGapRepairMinGapSeconds: Double = 1.5
     ) {
         self.sampleRate = sampleRate
         self.tdtConfig = tdtConfig
@@ -118,6 +139,8 @@ public struct ASRConfig: Sendable {
         self.dualDecodeArbitration = dualDecodeArbitration
         self.tokenFilterConfidenceThreshold = tokenFilterConfidenceThreshold
         self.edgePolicy = edgePolicy
+        self.seamGapRepair = seamGapRepair
+        self.seamGapRepairMinGapSeconds = max(0.5, seamGapRepairMinGapSeconds)
     }
 }
 
