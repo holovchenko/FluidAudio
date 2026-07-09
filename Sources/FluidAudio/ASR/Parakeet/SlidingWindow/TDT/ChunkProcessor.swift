@@ -398,6 +398,38 @@ struct ChunkProcessor {
     /// falls below the lower bound, no valid placement exists — skip the
     /// rescue rather than emit an invariant-violating start (unreachable for
     /// sane policies; defensive only).
+    private func rescueStartIfNeeded(
+        lastStart: Int,
+        chunkSamples: Int,
+        edgePolicy: ASREdgePolicy
+    ) -> [ChunkStartDecision] {
+        let frameSamples = ASRConstants.samplesPerEncoderFrame
+        // Safety note (review finding 2): `trustSpan` here is the nominal,
+        // un-shrunk span even though chunk 0 may be pad-shrunk by
+        // `leadingPadSamples` (Task 6). This is safe specifically for
+        // `lastStart == 0`: that only happens when there was a single
+        // dispatched window, which per `firstStrideSamples`'s guard requires
+        // `firstStrideSamples(...) >= totalSamples` — i.e. chunk 0's grid
+        // stride already covers the whole signal. Chunk 0's real (padded)
+        // content therefore already reaches `totalSamples`, so the nominal
+        // trustSpan can never under-cover and mis-fire a rescue window here.
+        let trustSpan = trustSpan(chunkSamples: chunkSamples, edgePolicy: edgePolicy)
+        guard totalSamples - lastStart > trustSpan else { return [] }
+
+        let rawRescueStart = totalSamples - trustSpan
+        let ceiledRescueStart = ((rawRescueStart + frameSamples - 1) / frameSamples) * frameSamples
+        let lowerBound = max(ceiledRescueStart, lastStart + frameSamples)
+
+        let rawUpperBound =
+            lastStart + chunkSamples - edgePolicy.trailingTrustSamples - edgePolicy.leadingPadSamples
+            - edgePolicy.matchMarginSamples
+        let upperBound = floorToFrame(rawUpperBound, frameSamples: frameSamples)
+
+        guard upperBound >= lowerBound else { return [] }
+
+        return [ChunkStartDecision(start: lowerBound, useWarmupPrefix: false)]
+    }
+
     /// Starved-terminal-window guard: true once `start`'s own trust region
     /// (`start ..< start + chunkSamples - trailingTrust`) already reaches
     /// `totalSamples`, meaning no later grid start is needed to cover the
@@ -426,40 +458,17 @@ struct ChunkProcessor {
         chunkSamples: Int,
         edgePolicy: ASREdgePolicy
     ) -> Bool {
-        let trustSpan = chunkSamples - edgePolicy.trailingTrustSamples
-        return totalSamples - start <= trustSpan
+        totalSamples - start <= trustSpan(chunkSamples: chunkSamples, edgePolicy: edgePolicy)
     }
 
-    private func rescueStartIfNeeded(
-        lastStart: Int,
-        chunkSamples: Int,
-        edgePolicy: ASREdgePolicy
-    ) -> [ChunkStartDecision] {
-        let frameSamples = ASRConstants.samplesPerEncoderFrame
-        // Safety note (review finding 2): `trustSpan` here is the nominal,
-        // un-shrunk span even though chunk 0 may be pad-shrunk by
-        // `leadingPadSamples` (Task 6). This is safe specifically for
-        // `lastStart == 0`: that only happens when there was a single
-        // dispatched window, which per `firstStrideSamples`'s guard requires
-        // `firstStrideSamples(...) >= totalSamples` — i.e. chunk 0's grid
-        // stride already covers the whole signal. Chunk 0's real (padded)
-        // content therefore already reaches `totalSamples`, so the nominal
-        // trustSpan can never under-cover and mis-fire a rescue window here.
-        let trustSpan = chunkSamples - edgePolicy.trailingTrustSamples
-        guard totalSamples - lastStart > trustSpan else { return [] }
-
-        let rawRescueStart = totalSamples - trustSpan
-        let ceiledRescueStart = ((rawRescueStart + frameSamples - 1) / frameSamples) * frameSamples
-        let lowerBound = max(ceiledRescueStart, lastStart + frameSamples)
-
-        let rawUpperBound =
-            lastStart + chunkSamples - edgePolicy.trailingTrustSamples - edgePolicy.leadingPadSamples
-            - edgePolicy.matchMarginSamples
-        let upperBound = floorToFrame(rawUpperBound, frameSamples: frameSamples)
-
-        guard upperBound >= lowerBound else { return [] }
-
-        return [ChunkStartDecision(start: lowerBound, useWarmupPrefix: false)]
+    /// Shared invariant: the span of a window's decoded output that is
+    /// trusted (not subject to being overwritten/rescued by a later
+    /// window), i.e. the chunk minus its trailing untrusted margin. Both
+    /// `isTerminallyTrustCovered` (grid-step check) and `rescueStartIfNeeded`
+    /// (after-the-fact coverage check) must agree on this span — hand-rolling
+    /// it twice risks the two checks silently drifting apart.
+    private func trustSpan(chunkSamples: Int, edgePolicy: ASREdgePolicy) -> Int {
+        chunkSamples - edgePolicy.trailingTrustSamples
     }
 
     /// Rounds `value` down to the nearest multiple of `frameSamples`,
