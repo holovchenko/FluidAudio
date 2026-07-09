@@ -295,15 +295,24 @@ final class EdgePolicyGridTests: XCTestCase {
     /// `leadingPadSamples`, mirroring `silenceAlignedChunkStarts`'s
     /// first-transition `latestCoveredStart` tightening — chunk 0's real
     /// content is shrunk by the pad regardless of which grid path produced
-    /// its start). For THIS fixture that pull-back happens to give
-    /// `regularChunkStarts` an extra naive window that already covers the
-    /// tail without needing `rescueStartIfNeeded` — collapsing what used to
-    /// be a 1-window skew against `silenceAlignedChunkStarts` (whose own
-    /// first window is unaffected here: the carved pocket sits well inside
-    /// even the tightened bound) down to exact parity. The one-window bound
-    /// `DualDecodeArbitration`'s merge-loop guards against
-    /// (`offset + 1 < chosenDecisions.count`) still holds — parity is
-    /// trivially within that tolerance — verified empirically below.
+    /// its start).
+    ///
+    /// Starved-terminal-window fix update: both grid loops now stop as soon
+    /// as the just-appended window's own trust region already reaches
+    /// `totalSamples` (`isTerminallyTrustCovered`), instead of blindly
+    /// stepping by stride until the *next* candidate start is past
+    /// `totalSamples`. For THIS fixture, `regularChunkStarts`' naive
+    /// (non-silence-aligned) window 1 already trust-covers the tail after
+    /// the first-transition pull-back, so it now stops one window earlier
+    /// than before the fix — reopening the 1-window skew against
+    /// `silenceAlignedChunkStarts` (whose window 1 is pulled back further by
+    /// the carved silence pocket and does need the extra rescue window).
+    /// Before this fix, `regularChunkStarts` would have appended that extra
+    /// window too, but it would have been payload-starved (audio end only
+    /// 9_600 samples past its start) — exactly the bug this fix removes.
+    /// The one-window bound `DualDecodeArbitration`'s merge-loop guards
+    /// against (`offset + 1 < chosenDecisions.count`) still holds — verified
+    /// empirically below.
     func testRegularGridSkewIsAtMostOneWindowVsSilenceAlignedGrid() throws {
         let rescuePolicy = ASREdgePolicy(leadingPadSeconds: 1.0, trailingTrustSeconds: 6.0, matchMarginSeconds: 1.0)
         let frameSamples = ASRConstants.samplesPerEncoderFrame
@@ -334,8 +343,10 @@ final class EdgePolicyGridTests: XCTestCase {
 
         XCTAssertGreaterThanOrEqual(silenceAlignedStarts.count, 2, "fixture must actually trigger a rescue entry")
         XCTAssertEqual(
-            silenceAlignedStarts.count, regularStarts.count,
-            "Task 6's first-transition pull-back now gives regularChunkStarts an extra naive window for this fixture, collapsing the previous 1-window skew to parity")
+            regularStarts.count, 2,
+            "regularChunkStarts' naive window 1 already trust-covers the tail for this fixture, so the "
+                + "starved-terminal-window fix must stop the grid there rather than append an extra, "
+                + "payload-starved window")
         XCTAssertLessThanOrEqual(
             silenceAlignedStarts.count - regularStarts.count, 1,
             "grid skew between the two paths must never exceed the one-window bound the merge loop's bounds guard tolerates")
@@ -393,6 +404,55 @@ final class EdgePolicyGridTests: XCTestCase {
         XCTAssertLessThanOrEqual(
             starts[1] + policy.leadingPadSamples + policy.matchMarginSamples, win0TrustEnd,
             "second window must compensate for window 0's pad-consumed head")
+    }
+
+    /// Starved-terminal-window bug: for a 37.8s clip (604_800 samples) under
+    /// `.default`, the naive stride grid places a third window start at
+    /// 555_520 with only 49_280 samples (3.08s) of real payload before
+    /// clamping to `totalSamples`. `rescueStartIfNeeded`'s guard
+    /// (`totalSamples - lastStart > trustSpan`) only fires on *coverage*
+    /// shortfall, not on this *payload* shortfall of the terminal window
+    /// itself, so no rescue is appended and the merge later drops audio
+    /// under this starved window (see ChunkProcessor.swift's
+    /// `trustFilteredForMerge`).
+    ///
+    /// The correct grid never needs the third window at all: window 1
+    /// (start 253_440)'s own trust region already reaches past
+    /// `totalSamples` (`604_800 - 253_440 = 351_360 <= chunkSamples -
+    /// trailingTrust = 382_720`), so no window should ever be appended past
+    /// it.
+    func testTerminalWindowNotStarvedForClipJustPastGridStart() throws {
+        let totalSamples = 604_800
+        let audio = [Float](repeating: 0.02, count: totalSamples)
+        let processor = ChunkProcessor(audioSamples: audio, edgePolicy: policy)
+        let starts = try processor.chunkStartsForTesting(melChunkContext: false, modelVersion: .v3)
+
+        // Explicit no-starved-window property: the terminal window's own
+        // payload (totalSamples - lastStart) must never be smaller than
+        // what its predecessor's trust region already failed to cover — if
+        // the predecessor's trust region already reaches totalSamples, no
+        // terminal window may be appended past it at all.
+        XCTAssertLessThanOrEqual(
+            starts.last!, 253_440,
+            "no grid start may sit past 253_440 for this clip: window 1's trust region already "
+                + "reaches totalSamples, so any later start is a payload-starved terminal window "
+                + "(here: \(totalSamples - starts.last!) samples of real payload)")
+        XCTAssertEqual(
+            starts, [0, 253_440],
+            "window 1's trust region already reaches totalSamples; a third, payload-starved window "
+                + "must not be appended")
+    }
+
+    /// Companion regression guard: a 32.4s clip (518_400 samples) whose
+    /// natural grid is already just [0, 253_440] (terminal payload 16.56s,
+    /// nowhere near starved) must be completely unaffected by the fix.
+    func testTerminalWindowUnchangedForAlreadyValidClip() throws {
+        let totalSamples = 518_400
+        let audio = [Float](repeating: 0.02, count: totalSamples)
+        let processor = ChunkProcessor(audioSamples: audio, edgePolicy: policy)
+        let starts = try processor.chunkStartsForTesting(melChunkContext: false, modelVersion: .v3)
+
+        XCTAssertEqual(starts, [0, 253_440])
     }
 
     /// Fix wave 1, Finding 1: `silenceAlignedChunkStarts`'s first-transition

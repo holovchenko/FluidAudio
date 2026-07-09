@@ -234,6 +234,11 @@ struct ChunkProcessor {
         var start = firstStrideSamples(strideSamples: strideSamples, edgePolicy: edgePolicy)
         while start < totalSamples {
             starts.append(ChunkStartDecision(start: start, useWarmupPrefix: false))
+            if let edgePolicy, isTerminallyTrustCovered(
+                start: start, chunkSamples: chunkSamples, edgePolicy: edgePolicy
+            ) {
+                break
+            }
             start += strideSamples
         }
         if let edgePolicy {
@@ -339,6 +344,11 @@ struct ChunkProcessor {
                 )
             )
             previousStart = bestStart
+            if let edgePolicy, isTerminallyTrustCovered(
+                start: bestStart, chunkSamples: chunkSamples, edgePolicy: edgePolicy
+            ) {
+                break
+            }
             target += strideSamples
         }
 
@@ -388,6 +398,38 @@ struct ChunkProcessor {
     /// falls below the lower bound, no valid placement exists — skip the
     /// rescue rather than emit an invariant-violating start (unreachable for
     /// sane policies; defensive only).
+    /// Starved-terminal-window guard: true once `start`'s own trust region
+    /// (`start ..< start + chunkSamples - trailingTrust`) already reaches
+    /// `totalSamples`, meaning no later grid start is needed to cover the
+    /// rest of the audio.
+    ///
+    /// Both grid-generation loops (`regularChunkStarts` /
+    /// `silenceAlignedChunkStarts`) previously kept stepping by `stride`
+    /// purely because `nextStart < totalSamples`, with no check on whether
+    /// the window just appended already trust-covers the tail. For clips
+    /// whose duration lands just past a stride-grid start (e.g. a 37.8s
+    /// clip under `.default`: window 1 at 253_440 already trust-covers
+    /// `totalSamples` = 604_800, since `604_800 − 253_440 = 351_360 ≤
+    /// chunkSamples − trailingTrust = 382_720`), the loop still appended one
+    /// more window whose real payload before clamping to `totalSamples` was
+    /// only a few seconds — a payload-starved terminal window whose tokens
+    /// past `rightKeepThreshold` are unusable, and which `rescueStartIfNeeded`
+    /// cannot see because its guard only fires on the opposite failure mode
+    /// (a *coverage* gap, `totalSamples − lastStart > trustSpan`, not a
+    /// *payload* shortfall in an already-appended terminal window).
+    ///
+    /// Uses the same `trustSpan` formula `rescueStartIfNeeded` uses, so a
+    /// grid step and the after-the-fact rescue check share one invariant
+    /// rather than each hand-rolling its own threshold.
+    private func isTerminallyTrustCovered(
+        start: Int,
+        chunkSamples: Int,
+        edgePolicy: ASREdgePolicy
+    ) -> Bool {
+        let trustSpan = chunkSamples - edgePolicy.trailingTrustSamples
+        return totalSamples - start <= trustSpan
+    }
+
     private func rescueStartIfNeeded(
         lastStart: Int,
         chunkSamples: Int,
