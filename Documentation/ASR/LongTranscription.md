@@ -267,6 +267,43 @@ The repair inspects only the tokenizer's own word-boundary marker, never
 transcript text, so it is language-agnostic. Without a vocabulary the merge
 is byte-for-byte unchanged.
 
+### Merge Order Is the Transcript Order (issue #825)
+
+`convertTokensToText` joins tokens in **array order**, so whatever order
+`mergeChunks` produces *is* the transcript. That order must not be
+re-derived from frame timestamps: TDT emits several tokens per 80 ms frame
+(many timestamps are equal), and two overlapping windows' frame indices do
+not co-register across a seam (different global offsets, mel-context and
+warmup frame adjustments), so a token that linearly follows another can
+carry a numerically smaller timestamp. Sorting by that key interleaves
+subwords from the two windows — `"Für die"` → `"die Für"`, `"Punkt"` →
+`"Pktun"`.
+
+`enforceMonotonicTimestamps` therefore replaces the old global sort: it
+clamps each backward step up to the running maximum **without reordering**,
+so word timing and the seam-gap repair pass below still see a monotonic
+sequence while the merged text order survives intact.
+
+### Post-Merge Repair Pass (issue #758)
+
+The merge can still deterministically drop multi-second spans of clear
+speech at a seam when the overlap region is low-SNR (crosstalk, applause,
+soft speech) — the failure is decoder-state dependent and moves rather than
+disappears when the chunk layout changes, so no geometry knob fixes the
+class.
+
+When `ASRConfig.seamGapRepair` is on (default), inter-token gaps longer than
+`seamGapRepairMinGapSeconds` (default 1.5 s) whose audio carries
+speech-level energy are re-decoded with one fresh window that starts **at
+the gap** (cold-starting the decoder on the dropped speech), with a
+gap-centred placement as fallback. Only tokens strictly inside the gap are
+spliced in, starting at a word-initial piece and edge-deduped against the
+neighbouring words. Genuine silence yields no in-gap tokens and is left
+untouched.
+
+Cost: one extra window decode per probed gap, and only on the multi-window
+batch path — audio shorter than one window never triggers it.
+
 ## Streaming Threshold for Large Files
 
 `ASRConfig` also exposes two knobs that are not about chunk boundary quality
